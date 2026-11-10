@@ -16,10 +16,13 @@
         "30"
     ],
     "filament_cost": [
-        "49.99"
+        "46.99"
     ],
     "filament_density": [
         "0.99"
+    ],
+    "filament_dev_drying_cooling_temperature": [
+        "70"
     ],
     "filament_flow_ratio": [
         "0.52"
@@ -42,8 +45,8 @@
     "filament_z_hop_types": [
         "Normal Lift"
     ],
-    "filament_scarf_seam_type": [
-        "none"
+    "fins_extrude_safe_temp": [
+        "85"
     ],
     "impact_strength_z": [
         "3.4"
@@ -62,5 +65,8 @@
     ],
     "slow_down_layer_time": [
         "5"
+    ],
+    "temperature_vitrification": [
+        "70"
     ]
 }

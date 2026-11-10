@@ -7,13 +7,100 @@
 
 namespace Slic3r
 {
+// ==================== MaxFlowWithLowerBounds ====================
+    struct MaxFlowWithLowerBounds {
+    public:
+
+        void add_edge(int from, int to, int capacity);
+
+        bool bfs();
+        int dfs(int u, int f);
+        int solve(std::vector<int>& matching);
+
+    public:
+        std::vector<int> l_nodes;
+        std::vector<int> r_nodes;
+        std::vector<Edge> edges;
+        std::vector<std::vector<int>> adj;
+        std::vector<int> level;
+        std::vector<int> it;
+
+        int total_nodes{ -1 };
+        int source_id{ -1 };
+        int sink_id{ -1 };
+    };
+
+    void MaxFlowWithLowerBounds::add_edge(int from, int to, int capacity)
+    {
+        adj[from].emplace_back(edges.size());
+        edges.emplace_back(from, to, capacity, 0);
+        // also add reverse edge ,set capacity to zero,cost to negative
+        adj[to].emplace_back(edges.size());
+        edges.emplace_back(to, from, 0, 0);
+    }
+
+    bool MaxFlowWithLowerBounds::bfs() {
+        level.assign(total_nodes, -1);
+        std::queue<int> q;
+        q.push(source_id);
+        level[source_id] = 0;
+
+        while (!q.empty()) {
+            int u = q.front(); q.pop();
+            for (int eid : adj[u]) {
+                Edge &e = edges[eid];
+                if (e.flow < e.capacity && level[e.to] == -1) {
+                    level[e.to] = level[u] + 1;
+                    q.push(e.to);
+                }
+            }
+        }
+        return level[sink_id] != -1;
+    }
+
+    int MaxFlowWithLowerBounds::dfs(int u, int f) {
+        if (u == sink_id) return f;
+        for (int &i = it[u]; i < (int)adj[u].size(); ++i) {
+            int eid = adj[u][i];
+            Edge &e = edges[eid];
+            if (e.flow < e.capacity && level[e.to] == level[u] + 1) {
+                int pushed = dfs(e.to, std::min(f, e.capacity - e.flow));
+                if (pushed > 0) {
+                    e.flow += pushed;
+                    edges[eid ^ 1].flow -= pushed;
+                    return pushed;
+                }
+            }
+        }
+        return 0;
+    }
+
+    int MaxFlowWithLowerBounds::solve(std::vector<int>& matching) {
+        int flow = 0;
+        while (bfs()) {
+            it.assign(total_nodes, 0);
+            while (int pushed = dfs(source_id, MaxFlowGraph::INF))
+                flow += pushed;
+        }
+
+        int L = l_nodes.size();
+        int R = r_nodes.size();
+        // collect l-r matches
+        matching.resize(l_nodes.size(), MaxFlowGraph::INVALID_ID);
+        for (int u = 0; u < L; ++u) {
+            for (int eid : adj[u]) {
+                Edge &e = edges[eid];
+                if (e.flow > 0 && e.to >= L && e.to < L + R) {
+                    matching[e.from] = e.to - L;
+                }
+            }
+        }
+        return flow;
+    }
+
+// ==================== MinCostMaxFlow ====================
     struct MinCostMaxFlow {
     public:
-        struct Edge {
-            int from, to, capacity, cost, flow;
-            Edge(int u, int v, int cap, int cst) : from(u), to(v), capacity(cap), cost(cst), flow(0) {}
-        };
-
         std::vector<int> solve();
         void add_edge(int from, int to, int capacity, int cost);
         bool spfa(int source, int sink);
@@ -41,7 +128,7 @@ namespace Slic3r
             for (int eid : adj[u]) {
                 Edge& e = edges[eid];
                 if (e.flow > 0 && e.to >= l_nodes.size() && e.to < l_nodes.size() + r_nodes.size())
-                    matching[e.from] = r_nodes[e.to - l_nodes.size()];
+                    matching[e.from] = e.to - l_nodes.size();
             }
         }
 
@@ -107,43 +194,51 @@ namespace Slic3r
     {
         if (l_nodes[idx_in_left] == -1) {
             return 0;
-            //TODO: test more here
-            int sum = 0;
-            for (int i = 0; i < matrix.size(); ++i)
-                sum += matrix[i][idx_in_right];
-            sum /= matrix.size();
-            return -sum;
         }
 
-        return matrix[l_nodes[idx_in_left]][r_nodes[idx_in_right]];
+        float val = matrix[l_nodes[idx_in_left]][r_nodes[idx_in_right]];
+        return std::min(static_cast<int>(val), MaxFlowGraph::MCMF_MAX_EDGE_COST);
     }
 
-
+// ==================== MaxFlowSolver ====================
     MaxFlowSolver::MaxFlowSolver(const std::vector<int>& u_nodes, const std::vector<int>& v_nodes,
         const std::unordered_map<int, std::vector<int>>& uv_link_limits,
         const std::unordered_map<int, std::vector<int>>& uv_unlink_limits,
         const std::vector<int>& u_capacity,
-        const std::vector<int>& v_capacity)
+        const std::vector<int>& v_capacity,
+        const std::vector<std::pair<std::set<int>,int>>& v_group_capacity)
     {
         assert(u_capacity.empty() || u_capacity.size() == u_nodes.size());
         assert(v_capacity.empty() || v_capacity.size() == v_nodes.size());
         l_nodes = u_nodes;
         r_nodes = v_nodes;
-        total_nodes = u_nodes.size() + v_nodes.size() + 2;
+        total_nodes = u_nodes.size() + v_nodes.size() + v_group_capacity.size() + 2;
         source_id = total_nodes - 2;
         sink_id = total_nodes - 1;
 
         adj.resize(total_nodes);
+
+        std::vector<int>v_node_to(v_nodes.size(), sink_id);
+        for (size_t gid = 0; gid < v_group_capacity.size(); ++gid) {
+            for (auto vid : v_group_capacity[gid].first)
+                v_node_to[vid] = l_nodes.size() + r_nodes.size() + gid;
+        }
 
         // add edge from source to left nodes
         for (int idx = 0; idx < l_nodes.size(); ++idx) {
             int capacity = u_capacity.empty() ? 1 : u_capacity[idx];
             add_edge(source_id, idx, capacity);
         }
-        // add edge from right nodes to sink node
+        // add edge from right nodes to v_node_to(sink node or temp group node)
         for (int idx = 0; idx < r_nodes.size(); ++idx) {
             int capacity = v_capacity.empty() ? 1 : v_capacity[idx];
-            add_edge(l_nodes.size() + idx, sink_id, capacity);
+            add_edge(l_nodes.size() + idx, v_node_to[idx], capacity);
+        }
+
+        // add edge from temp group node to sink node
+        for (int idx = 0; idx < v_group_capacity.size(); ++idx) {
+            int capacity = v_group_capacity[idx].second;
+            add_edge(l_nodes.size() + r_nodes.size() + idx, sink_id, capacity);
         }
 
         // add edge from left nodes to right nodes
@@ -228,6 +323,7 @@ namespace Slic3r
         return matching;
     }
 
+// ==================== GeneralMinCostSolver ====================
     GeneralMinCostSolver::~GeneralMinCostSolver()
     {
     }
@@ -235,7 +331,7 @@ namespace Slic3r
     GeneralMinCostSolver::GeneralMinCostSolver(const std::vector<std::vector<float>>& matrix_, const std::vector<int>& u_nodes, const std::vector<int>& v_nodes)
     {
         m_solver = std::make_unique<MinCostMaxFlow>();
-        m_solver->matrix = matrix_;;
+        m_solver->matrix = matrix_;
         m_solver->l_nodes = u_nodes;
         m_solver->r_nodes = v_nodes;
 
@@ -269,6 +365,301 @@ namespace Slic3r
         return m_solver->solve();
     }
 
+// ==================== GeneralMinCostLowerBoundsSolver ====================
+    GeneralMinCostLowerBoundsSolver::~GeneralMinCostLowerBoundsSolver() = default;
+
+    GeneralMinCostLowerBoundsSolver::GeneralMinCostLowerBoundsSolver(const std::vector<FlushMatrix>                  &matrix_,
+                                                                     const std::vector<int>                          &u_nodes,
+                                                                     const std::vector<int>                          &v_nodes,
+                                                                     const std::vector<int>                          &v_nodes_group,
+                                                                     const std::unordered_map<int, std::vector<int>> &uv_link_limits,
+                                                                     const std::unordered_map<int, std::vector<int>> &uv_unlink_limits)
+    {
+        flush_matrix       = matrix_;
+        l_nodes            = u_nodes;
+        r_nodes            = v_nodes;
+        r_nodes_group      = v_nodes_group;
+        m_uv_link_limits   = uv_link_limits;
+        m_uv_unlink_limits = uv_unlink_limits;
+        num_groups         = *std::max_element(r_nodes_group.begin(), r_nodes_group.end()) + 1;
+
+        m_solver_lower_bounds = std::make_unique<MaxFlowWithLowerBounds>();
+        m_solver_min_cost = std::make_unique<MinCostMaxFlow>();
+    }
+
+    std::vector<int> GeneralMinCostLowerBoundsSolver::solve()
+    {
+        // 不需要下界约束的group节点
+        std::unordered_set<int> no_lower_group;
+        for (int i = 0; i < r_nodes.size(); i++) {
+            if (r_nodes[i] >= 0)
+                no_lower_group.insert(r_nodes_group[i]);
+        }
+
+        // 1. 构建下界网络图
+        build_feasible_graph(no_lower_group);
+
+        // 2. 计算最大流
+        int need = 0;
+        for (int d : demand)
+            if (d > 0) need += d;
+        std::vector<int> feasible_matching;
+        int pushed_flow = m_solver_lower_bounds->solve(feasible_matching);
+        assert(need == pushed_flow);
+
+        // 3. 下界最大流网络转化为最小费用最大流网络
+        build_graph_with_feasible_result();
+        // 4. 计算最小费用最大流
+        auto min_cost_matching = m_solver_min_cost->solve();
+
+        return min_cost_matching;
+    }
+
+    void GeneralMinCostLowerBoundsSolver::build_feasible_graph(const std::unordered_set<int> &no_lower_groups)
+    {
+        m_solver_lower_bounds->l_nodes = l_nodes;
+        m_solver_lower_bounds->r_nodes = r_nodes;
+        m_solver_lower_bounds->total_nodes = l_nodes.size() + r_nodes.size() + num_groups + 2;
+
+        m_solver_lower_bounds->source_id = m_solver_lower_bounds->total_nodes - 2;
+        m_solver_lower_bounds->sink_id   = m_solver_lower_bounds->total_nodes - 1;
+        m_solver_lower_bounds->adj.resize(m_solver_lower_bounds->total_nodes);
+        demand.resize(m_solver_lower_bounds->total_nodes, 0);
+
+        const int L = m_solver_lower_bounds->l_nodes.size();
+        const int R = m_solver_lower_bounds->r_nodes.size();
+
+        // source -> l
+        for (int i = 0; i < L; ++i)
+            m_solver_lower_bounds->add_edge(m_solver_lower_bounds->source_id, i, 1);
+
+        // u -> v (with link/unlink limits)
+        for (int i = 0; i < L; ++i) {
+            if (auto it = m_uv_link_limits.find(i); it != m_uv_link_limits.end()) {
+                for (int j : it->second)
+                    m_solver_lower_bounds->add_edge(i, L + j, 1);
+                continue;
+            }
+
+            std::optional<std::vector<int>> unlink_limits;
+            if (auto it = m_uv_unlink_limits.find(i); it != m_uv_unlink_limits.end())
+                unlink_limits = it->second;
+
+            for (int j = 0; j < R; ++j) {
+                if (unlink_limits.has_value() && std::find(unlink_limits->begin(), unlink_limits->end(), j) != unlink_limits->end())
+                    continue;
+                m_solver_lower_bounds->add_edge(i, L + j, 1);
+            }
+        }
+
+        // r -> group
+        for (int j = 0; j < R; ++j) {
+            int g = r_nodes_group[j];
+            m_solver_lower_bounds->add_edge(L + j, L + R + g, 1);
+        }
+
+        // group -> sink（low bound=1）
+        for (int g = 0; g < num_groups; ++g) {
+            if (no_lower_groups.count(g))
+                m_solver_lower_bounds->add_edge(L + R + g, m_solver_lower_bounds->sink_id, R);
+            else
+                add_edge_with_lower_bound(L + R + g, m_solver_lower_bounds->sink_id, 1, R, 0);
+        }
+
+        max_flow_edges = m_solver_lower_bounds->edges.size();
+
+        // support lower bounds, add super source  super sink
+        super_source = m_solver_lower_bounds->total_nodes++;
+        super_sink = m_solver_lower_bounds->total_nodes++;
+
+        m_solver_lower_bounds->adj.resize(m_solver_lower_bounds->total_nodes);
+        demand.resize(m_solver_lower_bounds->total_nodes, 0);
+
+        for (int i = 0; i < super_source; ++i) {
+            if (demand[i] > 0) {
+                m_solver_lower_bounds->add_edge(super_source, i, demand[i]);
+            } else if (demand[i] < 0) {
+                m_solver_lower_bounds->add_edge(i, super_sink, -demand[i]);
+            }
+        }
+        m_solver_lower_bounds->add_edge(m_solver_lower_bounds->sink_id, m_solver_lower_bounds->source_id, MaxFlowGraph::INF);
+        source_id = m_solver_lower_bounds->source_id;
+        sink_id = m_solver_lower_bounds->sink_id;
+        m_solver_lower_bounds->source_id = super_source;
+        m_solver_lower_bounds->sink_id = super_sink;
+    }
+
+    void GeneralMinCostLowerBoundsSolver::build_graph_with_feasible_result()
+    {
+        for (auto&lb:lower_bound_edges){
+            m_solver_lower_bounds->edges[lb.edge_id].flow += lb.lower;
+            m_solver_lower_bounds->edges[lb.edge_id ^ 1].flow -= lb.lower;
+        }
+
+        m_solver_min_cost->l_nodes = m_solver_lower_bounds->l_nodes;
+        m_solver_min_cost->r_nodes = m_solver_lower_bounds->r_nodes;
+
+        m_solver_min_cost->source_id = source_id;
+        m_solver_min_cost->sink_id = sink_id;
+        m_solver_min_cost->total_nodes = sink_id + 1;
+
+        m_solver_min_cost->edges = m_solver_lower_bounds->edges;
+        m_solver_min_cost->edges.erase(m_solver_min_cost->edges.begin() + max_flow_edges, m_solver_min_cost->edges.end());
+
+        m_solver_min_cost->adj = m_solver_lower_bounds->adj;
+        m_solver_min_cost->adj.resize(m_solver_min_cost->total_nodes);
+        for (auto &node_edges : m_solver_min_cost->adj) {
+            node_edges.erase(std::remove_if(node_edges.begin(), node_edges.end(), [this](int val) {return val >= this->max_flow_edges;}), node_edges.end());
+        }
+
+
+        for (auto& e : m_solver_min_cost->edges) {
+            int L            = m_solver_min_cost->l_nodes.size();
+            int R            = m_solver_min_cost->r_nodes.size();
+
+            if (e.from < L && e.to >= L && e.to < L + R) {
+                int idx_in_left  = e.from;
+                int idx_in_right = e.to - L;
+                int group_id = r_nodes_group[idx_in_right];
+
+                if (r_nodes[idx_in_right] == -1) continue;
+                e.cost = flush_matrix[group_id][l_nodes[idx_in_left]][r_nodes[idx_in_right]];
+            }
+        }
+    }
+    void GeneralMinCostLowerBoundsSolver::add_edge_with_lower_bound(int from, int to, int lower, int upper, int cost)
+    {
+        int eid = m_solver_lower_bounds->edges.size();
+        m_solver_lower_bounds->add_edge(from, to, upper - lower);
+
+        lower_bound_edges.push_back({eid, lower});
+        demand[from] -= lower;
+        demand[to]   += lower;
+    }
+
+// ==================== GroupMinCostFlowSolver ====================
+    GroupMinCostFlowSolver::~GroupMinCostFlowSolver() = default;
+
+    GroupMinCostFlowSolver::GroupMinCostFlowSolver(const std::vector<FlushMatrix>                  &matrix_,
+                                                   const std::vector<int>                          &u_nodes,
+                                                   const std::vector<int>                          &v_nodes,
+                                                   const std::vector<int>                          &v_nodes_group,
+                                                   const std::unordered_map<int, std::vector<int>> &uv_link_limits,
+                                                   const std::unordered_map<int, std::vector<int>> &uv_unlink_limits)
+    {
+        flush_matrix       = matrix_;
+        l_nodes            = u_nodes;
+        r_nodes            = v_nodes;
+        r_nodes_group      = v_nodes_group;
+        m_uv_link_limits   = uv_link_limits;
+        m_uv_unlink_limits = uv_unlink_limits;
+        num_groups         = *std::max_element(r_nodes_group.begin(), r_nodes_group.end()) + 1;
+
+        m_solver = std::make_unique<MinCostMaxFlow>();
+        build_graph();
+    }
+
+    int GroupMinCostFlowSolver::get_flush_cost(int l_idx, int r_idx)
+    {
+        if (r_nodes[r_idx] == -1)
+            return 0;
+        int group_id = r_nodes_group[r_idx];
+        return (int)flush_matrix[group_id][l_nodes[l_idx]][r_nodes[r_idx]];
+    }
+
+    void GroupMinCostFlowSolver::build_graph()
+    {
+        const int L = (int)l_nodes.size();
+        const int R = (int)r_nodes.size();
+        const int G = num_groups;
+
+        m_solver->l_nodes    = l_nodes;
+        m_solver->r_nodes    = r_nodes;
+        m_solver->total_nodes = L + R + G + 2;
+        m_solver->source_id  = L + R + G;
+        m_solver->sink_id    = L + R + G + 1;
+        m_solver->adj.resize(m_solver->total_nodes);
+
+        int max_flush = 0;
+        for (const auto &mat : flush_matrix)
+            for (const auto &row : mat)
+                for (float v : row)
+                    max_flush = std::max(max_flush, (int)v);
+        int bonus = max_flush * L + 1;
+
+        // source -> l_i
+        for (int i = 0; i < L; ++i)
+            m_solver->add_edge(m_solver->source_id, i, 1, 0);
+
+        // l_i -> r_j (with link/unlink limits)
+        for (int i = 0; i < L; ++i) {
+            if (auto it = m_uv_link_limits.find(i); it != m_uv_link_limits.end()) {
+                for (int j : it->second)
+                    m_solver->add_edge(i, L + j, 1, get_flush_cost(i, j));
+                continue;
+            }
+
+            std::optional<std::vector<int>> unlink_limits;
+            if (auto it = m_uv_unlink_limits.find(i); it != m_uv_unlink_limits.end())
+                unlink_limits = it->second;
+
+            for (int j = 0; j < R; ++j) {
+                if (unlink_limits.has_value() && std::find(unlink_limits->begin(), unlink_limits->end(), j) != unlink_limits->end())
+                    continue;
+                m_solver->add_edge(i, L + j, 1, get_flush_cost(i, j));
+            }
+        }
+
+        // r_j -> group_g
+        // Compute per-nozzle incoming edge count as capacity upper bound.
+        // When unlink_limits restrict multiple filaments to the same nozzle,
+        // capacity=1 would block valid assignments. Using the actual in-degree
+        // allows the necessary flow while still preserving nozzle-level balance
+        // (a nozzle with fewer forced filaments keeps a tighter cap).
+        // The first unit carries a small nozzle-bonus to encourage spreading
+        // filaments across distinct nozzles within the same group.
+        int nozzle_bonus = max_flush + 1;
+        std::vector<int> r_in_degree(R, 0);
+        for (int i = 0; i < L; ++i) {
+            if (auto it = m_uv_link_limits.find(i); it != m_uv_link_limits.end()) {
+                for (int j : it->second)
+                    r_in_degree[j]++;
+                continue;
+            }
+            std::optional<std::vector<int>> unlink_limits;
+            if (auto it = m_uv_unlink_limits.find(i); it != m_uv_unlink_limits.end())
+                unlink_limits = it->second;
+            for (int j = 0; j < R; ++j) {
+                if (unlink_limits.has_value() && std::find(unlink_limits->begin(), unlink_limits->end(), j) != unlink_limits->end())
+                    continue;
+                r_in_degree[j]++;
+            }
+        }
+
+        for (int j = 0; j < R; ++j) {
+            int g = r_nodes_group[j];
+            int cap = std::max(r_in_degree[j], 1);
+            // First unit gets -nozzle_bonus to prefer using distinct nozzles
+            m_solver->add_edge(L + j, L + R + g, 1, -nozzle_bonus);
+            if (cap > 1)
+                m_solver->add_edge(L + j, L + R + g, cap - 1, 0);
+        }
+
+        // group_g -> sink (split: first unit gets -bonus, rest gets 0)
+        // bonus >> nozzle_bonus, so group coverage always takes priority
+        for (int g = 0; g < G; ++g) {
+            m_solver->add_edge(L + R + g, m_solver->sink_id, 1, -bonus);
+            if (L > 1)
+                m_solver->add_edge(L + R + g, m_solver->sink_id, L - 1, 0);
+        }
+    }
+
+    std::vector<int> GroupMinCostFlowSolver::solve()
+    {
+        return m_solver->solve();
+    }
+
+// ==================== MinFlushFlowSolver ====================
     MinFlushFlowSolver::~MinFlushFlowSolver()
     {
     }
@@ -277,7 +668,8 @@ namespace Slic3r
         const std::unordered_map<int, std::vector<int>>& uv_link_limits,
         const std::unordered_map<int, std::vector<int>>& uv_unlink_limits,
         const std::vector<int>& u_capacity,
-        const std::vector<int>& v_capacity)
+        const std::vector<int>& v_capacity,
+        const std::vector<std::pair<std::set<int>,int>>&v_group_capacity)
     {
         assert(u_capacity.empty() || u_capacity.size() == u_nodes.size());
         assert(v_capacity.empty() || v_capacity.size() == v_nodes.size());
@@ -286,12 +678,18 @@ namespace Slic3r
         m_solver->l_nodes = u_nodes;
         m_solver->r_nodes = v_nodes;
 
-        m_solver->total_nodes = u_nodes.size() + v_nodes.size() + 2;
+        m_solver->total_nodes = u_nodes.size() + v_nodes.size() + v_group_capacity.size() + 2;
 
         m_solver->source_id =m_solver->total_nodes - 2;
         m_solver->sink_id = m_solver->total_nodes - 1;
 
         m_solver->adj.resize(m_solver->total_nodes);
+
+        std::vector<int> v_node_to(v_nodes.size(), m_solver->sink_id);
+        for (size_t gid = 0; gid < v_group_capacity.size(); ++gid) {
+            for (auto vid : v_group_capacity[gid].first)
+                v_node_to[vid] = m_solver->l_nodes.size() + m_solver->r_nodes.size() + gid;
+        }
 
         // add edge from source to left nodes,cost to 0
         for (int i = 0; i < m_solver->l_nodes.size(); ++i) {
@@ -301,7 +699,12 @@ namespace Slic3r
         // add edge from right nodes to sink,cost to 0
         for (int i = 0; i < m_solver->r_nodes.size(); ++i) {
             int capacity = v_capacity.empty() ? 1 : v_capacity[i];
-            m_solver->add_edge(m_solver->l_nodes.size() + i, m_solver->sink_id, capacity, 0);
+            m_solver->add_edge(m_solver->l_nodes.size() + i, v_node_to[i], capacity, 0);
+        }
+        // add edge from temp group node to sink node
+        for(int i=0;i<v_group_capacity.size();++i){
+            int capacity = v_group_capacity[i].second;
+            m_solver->add_edge(m_solver->l_nodes.size() + m_solver->r_nodes.size() + i, m_solver->sink_id, capacity, 0);
         }
         // add edge from left node to right nodes
         for (int i = 0; i < m_solver->l_nodes.size(); ++i) {
@@ -329,6 +732,7 @@ namespace Slic3r
         return m_solver->solve();
     }
 
+// ==================== MatchModeGroupSolver ====================
     MatchModeGroupSolver::~MatchModeGroupSolver()
     {
     }
@@ -377,6 +781,7 @@ namespace Slic3r
         return m_solver->solve();
     }
 
+// ==================== static functions ====================
     //solve the problem by searching the least flush of current filament
     static std::vector<unsigned int> solve_extruder_order_with_greedy(const std::vector<std::vector<float>>& wipe_volumes,
         const std::vector<unsigned int> curr_layer_extruders,
@@ -425,7 +830,6 @@ namespace Slic3r
         float* min_cost)
     {
         std::sort(curr_layer_extruders.begin(), curr_layer_extruders.end());
-        std::sort(next_layer_extruders.begin(), next_layer_extruders.end());
         float best_cost = std::numeric_limits<float>::max();
         int best_change = std::numeric_limits<int>::max(); // add filament change check in case flush volume between different filament is 0
         std::vector<unsigned int>best_seq;
@@ -455,6 +859,7 @@ namespace Slic3r
             }
             if (curr_layer_cost > best_cost)
                 continue;
+            std::sort(next_layer_extruders.begin(), next_layer_extruders.end());
             do {
                 std::optional<unsigned int>prev_extruder_2 = prev_extruder_1;
                 float total_cost = curr_layer_cost;
@@ -559,7 +964,6 @@ namespace Slic3r
     }
 
 
-
     template<class T>
     static std::vector<T> collect_filaments_in_groups(const std::unordered_set<unsigned int>& group, const std::vector<unsigned int>& filament_list) {
         std::vector<T>ret;
@@ -602,12 +1006,124 @@ namespace Slic3r
     }
 
 
+
+
+    // TODO:  add cusotm sequence
+    static int reorder_filaments_for_minimum_flush_volume_base(const std::vector<unsigned int>& filament_lists,
+        const std::vector<std::vector<unsigned int>>& layer_filaments,
+        const FlushMatrix& flush_matrix,
+        const std::function<bool(int, std::vector<int>&)> get_custom_seq,
+        std::vector<std::vector<unsigned int>>* filament_sequences,
+        std::optional<unsigned int> initial_filament_id = std::nullopt)
+    {
+        constexpr int max_n_with_forcast = 5;
+        using uint128_t = boost::multiprecision::uint128_t;
+
+        if (filament_sequences) {
+            filament_sequences->clear();
+            filament_sequences->reserve(layer_filaments.size());
+        }
+        auto          filament_list_to_hash_key = [](const std::vector<unsigned int>& curr_layer_filaments, const std::vector<unsigned int>& next_layer_filaments,
+            const std::optional<unsigned int>& prev_filament, bool use_forcast) -> uint128_t {
+                uint128_t hash_key = 0;
+                // 31-0 bit define current layer extruder,63-32 bit define next layer extruder,95~64 define prev extruder
+                if (prev_filament) hash_key |= (uint128_t(1) << (64 + *prev_filament));
+
+                if (use_forcast) {
+                    for (auto item : next_layer_filaments) { hash_key |= (uint128_t(1) << (32 + item)); }
+                }
+
+                for (auto item : curr_layer_filaments) { hash_key |= (uint128_t(1) << item); }
+                return hash_key;
+            };
+
+        int cost = 0;
+        std::map<size_t, std::vector<unsigned int>> custom_layer_sequence_map;
+        std::unordered_map<uint128_t, std::pair<float, std::vector<unsigned int>>> caches;
+        std::unordered_set<unsigned int> filament_sets(filament_lists.begin(), filament_lists.end());
+        std::optional<unsigned int>      curr_filament_id;
+        // 如果传入了有效的初始材料ID，则使用它作为初始状态
+        if (initial_filament_id.has_value() && *initial_filament_id < flush_matrix.size()) {
+            curr_filament_id = initial_filament_id;
+        }
+
+        for (size_t layer = 0; layer < layer_filaments.size(); ++layer){
+            const auto& curr_lf = layer_filaments[layer];
+            std::vector<int> custom_filament_seq;
+            if (get_custom_seq && get_custom_seq(layer, custom_filament_seq) && !custom_filament_seq.empty()) {
+                std::vector<unsigned int> unsign_custom_extruder_seq;
+                for (int extruder : custom_filament_seq) {
+                    unsigned int unsign_extruder = static_cast<unsigned int>(extruder) - 1;
+                    auto it = std::find(layer_filaments[layer].begin(), layer_filaments[layer].end(), unsign_extruder);
+                    if (it != layer_filaments[layer].end())
+                        unsign_custom_extruder_seq.emplace_back(unsign_extruder);
+                }
+                assert(layer_filaments[layer].size() == unsign_custom_extruder_seq.size());
+
+                custom_layer_sequence_map[layer] = unsign_custom_extruder_seq;
+            }
+        }
+
+        for (size_t layer = 0; layer < layer_filaments.size(); ++layer) {
+            const auto& curr_lf = layer_filaments[layer];
+
+            if(auto iter = custom_layer_sequence_map.find(layer); iter != custom_layer_sequence_map.end()){
+                auto sequence_in_group = collect_filaments_in_groups<unsigned int>(std::unordered_set<unsigned int>(filament_lists.begin(),filament_lists.end()), iter->second);
+
+                std::optional<unsigned int> prev = curr_filament_id;
+                for (auto& f: sequence_in_group){
+                    if(prev)
+                        cost += flush_matrix[*prev][f];
+                    prev = f;
+                }
+
+                if(!sequence_in_group.empty()){
+                    curr_filament_id = sequence_in_group.back();
+                }
+
+                if(filament_sequences)
+                    filament_sequences->emplace_back(sequence_in_group);
+
+                continue;
+            }
+
+            std::vector<unsigned int> filament_used = collect_filaments_in_groups<unsigned int>(filament_sets, curr_lf);
+            std::vector<unsigned int> next_lf;
+            if (layer + 1 < layer_filaments.size()) next_lf = layer_filaments[layer + 1];
+            std::vector<unsigned int> filament_used_next_layer = collect_filaments_in_groups<unsigned int>(filament_sets, next_lf);
+
+            bool                      use_forcast = false;
+            float                     tmp_cost = 0;
+            std::vector<unsigned int> sequence;
+            uint128_t                 hash_key = filament_list_to_hash_key(filament_used, filament_used_next_layer, curr_filament_id, use_forcast);
+            if (auto iter = caches.find(hash_key); iter != caches.end()) {
+                tmp_cost = iter->second.first;
+                sequence = iter->second.second;
+            }
+            else {
+                sequence = get_extruders_order(flush_matrix, filament_used, filament_used_next_layer, curr_filament_id, use_forcast, &tmp_cost);
+                caches[hash_key] = { tmp_cost,sequence };
+            }
+
+            if (filament_sequences)
+                filament_sequences->emplace_back(sequence);
+
+            if (!sequence.empty())
+                curr_filament_id = sequence.back();
+
+            cost += tmp_cost;
+        }
+
+        return cost;
+    }
+
     int reorder_filaments_for_minimum_flush_volume(const std::vector<unsigned int>& filament_lists,
         const std::vector<int>& filament_maps,
         const std::vector<std::vector<unsigned int>>& layer_filaments,
         const std::vector<FlushMatrix>& flush_matrix,
         std::optional<std::function<bool(int, std::vector<int>&)>> get_custom_seq,
-        std::vector<std::vector<unsigned int>>* filament_sequences)
+        std::vector<std::vector<unsigned int>>* filament_sequences,
+        const std::unordered_map<int, int>& nozzle_status)
     {
         //only when layer filament num <= 5,we do forcast
         constexpr int max_n_with_forcast = 5;
@@ -670,6 +1186,12 @@ namespace Slic3r
             if (groups[idx].empty())
                 continue;
             std::optional<unsigned int>current_extruder_id;
+            // 尝试从 nozzle_status 获取该 group(nozzle) 的初始 filament
+            if (auto it = nozzle_status.find(static_cast<int>(idx)); it != nozzle_status.end() && it->second >= 0) {
+                unsigned int initial_fil = static_cast<unsigned int>(it->second);
+                if (initial_fil < flush_matrix[idx].size())
+                    current_extruder_id = initial_fil;
+            }
 
             std::unordered_map<uint128_t, std::pair<float, std::vector<unsigned int>>> caches;
 
@@ -775,4 +1297,454 @@ namespace Slic3r
 
         return cost;
     }
+
+#if DEBUG_MULTI_NOZZLE_MCMF
+
+    //solve the problem by min cost max flow
+    static std::vector<std::vector<int>> solve_extruder_order_with_MCMF(const std::vector<std::vector<float>>& wipe_volumes,
+        const std::vector<int>& curr_layer_filaments,
+        const std::vector<int>& nozzle_state,
+        float* min_cost)
+    {
+        std::vector<std::vector<int>>ret;
+        std::vector<int>l_nodes = nozzle_state;
+        std::vector<int>r_nodes = curr_layer_filaments;
+        std::sort(r_nodes.begin(), r_nodes.end());
+
+        int nozzle_num = nozzle_state.size();
+        int filament_num = curr_layer_filaments.size();
+        int epochs = std::ceil(filament_num / (double)(nozzle_num));
+        for (int i = 0; i < epochs; ++i) {
+            GeneralMinCostSolver s(wipe_volumes, l_nodes, r_nodes);
+            auto match = s.solve();
+            ret.emplace_back(match);
+            l_nodes = match;
+
+            auto remove_iter = std::remove_if(r_nodes.begin(), r_nodes.end(), [match](auto item) {
+                return std::find(match.begin(), match.end(), item) != match.end();
+                });
+            r_nodes.erase(remove_iter, r_nodes.end());
+        }
+
+        if (min_cost) {
+            float cost = 0;
+            std::vector<int>nozzle_filament = nozzle_state;
+            for (int seq = 0; seq < ret.size(); ++seq) {
+                for (int id = 0; id < ret[seq].size(); ++id) {
+                    if (ret[seq][id] != -1) {
+                        if (nozzle_filament[id] != -1)
+                            cost += wipe_volumes[nozzle_filament[id]][ret[seq][id]];
+                        nozzle_filament[id] = ret[seq][id];
+                    }
+                }
+            }
+            *min_cost = cost;
+        }
+
+        return ret;
+    }
+
+        // get best filament order of multiple nozzle
+    std::vector<std::vector<int>> get_extruders_order(const std::vector<std::vector<float>>& wipe_volumes,
+        const std::vector<int>& curr_layer_filaments,
+        const std::vector<int>& nozzle_state,
+        float* min_cost)
+    {
+        return solve_extruder_order_with_MCMF(wipe_volumes, curr_layer_filaments, nozzle_state, min_cost);
+    }
+
+
+    // get nozzle match data when user set the filament sequence
+    static std::vector<std::vector<int>> get_nozzle_match_in_given_order(const std::vector<std::vector<float>>& wipe_volumes,
+        const std::vector<unsigned int>& layer_filaments_sequence,
+        const std::vector<int>& nozzle_state,
+        float* min_cost)
+    {
+        std::vector<std::vector<int>> ret;
+        std::vector<int>state = nozzle_state;
+        std::vector<int>filament_nozzles; //nozzles where each filament is placed
+
+        float cost = 0;
+
+        for (auto f : layer_filaments_sequence) {
+            float min_flush = std::numeric_limits<float>::max();
+            int min_flush_idx = -1;
+            for (size_t idx = 0; idx < state.size(); ++idx) {
+                float flush = (state[idx] == -1 ? 0 : wipe_volumes[state[idx]][f]);
+                if (flush < min_flush) {
+                    min_flush = flush;
+                    min_flush_idx = idx;
+                }
+            }
+            cost += min_flush;
+            state[min_flush_idx] = f;
+            filament_nozzles.emplace_back(min_flush_idx);
+        }
+
+        assert(filament_nozzles.size() == layer_filaments_sequence.size());
+        int prev = -1;
+        for (int idx = 0; idx < filament_nozzles.size(); ++idx) {
+            if (prev == -1 || filament_nozzles[idx] <= prev) {
+                ret.emplace_back(std::vector<int>(nozzle_state.size(), -1));
+            }
+            ret.back()[filament_nozzles[idx]] = layer_filaments_sequence[idx];
+            prev = filament_nozzles[idx];
+        }
+
+        if (min_cost)
+            *min_cost = cost;
+
+        return ret;
+    }
+    int reorder_filaments_for_multi_nozzle_extruder(const std::vector<unsigned int>& filament_lists,
+        const std::vector<int>& filament_maps,
+        const std::vector<std::vector<unsigned int>>& layer_filaments,
+        const std::vector<FlushMatrix>& flush_matrix,
+        std::optional<std::function<bool(int, std::vector<int>&)>> get_custom_seq,
+        int multi_nozzle_extruder_id,
+        int multi_nozzle_num,
+        std::vector<std::vector<unsigned int>>* layer_sequences,
+        std::vector<std::vector<std::vector<int>>>* nozzle_match_per_layer)
+    {
+        assert(0 <= multi_nozzle_extruder_id && multi_nozzle_extruder_id <= 1);
+
+        int fixed_nozzle_extruder_id = 1 - multi_nozzle_extruder_id;
+
+        std::vector<std::unordered_set<unsigned int>>groups(2); //save the grouped filaments
+        std::map<size_t, std::vector<unsigned int>>custom_layer_sequence_map;// save the filament sequences of custom layer
+
+        for (int i = 0; i < filament_maps.size(); ++i) {
+            if (filament_maps[i] == 0)
+                groups[0].insert(filament_lists[i]);
+            if (filament_maps[i] == 1)
+                groups[1].insert(filament_lists[i]);
+        }
+
+        // store custom layer sequence
+        for (size_t layer = 0; layer < layer_filaments.size(); ++layer) {
+            const auto& curr_lf = layer_filaments[layer];
+            std::vector<int>custom_filament_seq;
+            if (get_custom_seq && (*get_custom_seq)(layer, custom_filament_seq) && !custom_filament_seq.empty()) {
+                std::vector<unsigned int> unsign_custom_extruder_seq;
+                for (int extruder : custom_filament_seq) {
+                    unsigned int unsign_extruder = static_cast<unsigned int>(extruder) - 1;
+                    auto it = std::find(curr_lf.begin(), curr_lf.end(), unsign_extruder);
+                    if (it != curr_lf.end())
+                        unsign_custom_extruder_seq.emplace_back(unsign_extruder);
+                }
+                assert(curr_lf.size() == unsign_custom_extruder_seq.size());
+                custom_layer_sequence_map[layer] = unsign_custom_extruder_seq;
+            }
+        }
+
+        float cost = 0;
+        std::vector<std::vector<std::vector<int>>>nozzle_match_info;
+        std::vector<std::vector<std::vector<unsigned int>>>temp_layer_sequence(2);
+
+        // first deal with fixed nozzle
+        if (!groups[fixed_nozzle_extruder_id].empty())
+        {
+            int idx = fixed_nozzle_extruder_id;
+            std::vector<unsigned int> filament_used_in_group(groups[idx].begin(), groups[idx].end());
+            std::vector<int>filament_map_in_group(groups[idx].size(), idx);
+            cost += reorder_filaments_for_minimum_flush_volume(filament_used_in_group, filament_map_in_group, layer_filaments, flush_matrix, get_custom_seq, layer_sequences ? &temp_layer_sequence[idx] : nullptr);
+        }
+
+        //then deal with multiple nozzle
+        if (!groups[multi_nozzle_extruder_id].empty())
+        {
+            int idx = multi_nozzle_extruder_id;
+            if (layer_sequences)
+                temp_layer_sequence[idx].reserve(layer_filaments.size());
+            if (nozzle_match_per_layer)
+                nozzle_match_info.reserve(layer_filaments.size());
+
+            std::vector<int> nozzle_state(multi_nozzle_num, -1);
+
+            auto update_nozzle_state = [&nozzle_state](const std::vector<std::vector<int>>& match_info) {
+                for (size_t i = 0; i < match_info.size(); ++i) {
+                    for (size_t j = 0; j < match_info[i].size(); ++j)
+                        if (match_info[i][j] != -1)
+                            nozzle_state[j] = match_info[i][j];
+                }
+                };
+
+            for (size_t layer = 0; layer < layer_filaments.size(); ++layer) {
+                if (auto iter = custom_layer_sequence_map.find(layer); iter != custom_layer_sequence_map.end()) {
+                    const auto& sequence = iter->second;
+                    std::vector<unsigned int>sequence_in_group = collect_filaments_in_groups<unsigned int>(groups[idx], sequence);
+
+                    float tmp_cost = 0;
+                    auto nozzle_match = get_nozzle_match_in_given_order(flush_matrix[idx], sequence_in_group, nozzle_state, &tmp_cost);
+                    cost += tmp_cost;
+                    update_nozzle_state(nozzle_match);
+
+                    if (layer_sequences)
+                        temp_layer_sequence[idx].emplace_back(std::vector<unsigned int>()); // insert an empty array as placeholder
+                    if (nozzle_match_per_layer)
+                        nozzle_match_info.emplace_back(nozzle_match);
+                    continue;
+                }
+
+
+                const auto& curr_lf = layer_filaments[layer];
+                std::vector<int>filament_used_in_group = collect_filaments_in_groups<int>(groups[idx], curr_lf);
+
+                float tmp_cost = 0;
+                auto ret = solve_extruder_order_with_MCMF(flush_matrix[idx], filament_used_in_group, nozzle_state, &tmp_cost);
+                cost += tmp_cost;
+                update_nozzle_state(ret);
+
+                if (layer_sequences) {
+                    std::vector<unsigned int> flatten;
+                    for (size_t i = 0; i < ret.size(); ++i) {
+                        for (size_t j = 0; j < ret[i].size(); ++j)
+                            if (ret[i][j] != -1)
+                                flatten.emplace_back(ret[i][j]);
+                    }
+                    temp_layer_sequence[idx].emplace_back(flatten);
+                }
+                if (nozzle_match_per_layer)
+                    nozzle_match_info.emplace_back(ret);
+            }
+        }
+
+        // save the final sequence and match info if necessary
+        if (layer_sequences) {
+            layer_sequences->clear();
+            layer_sequences->resize(layer_filaments.size());
+            bool last_group = 0;
+            //if last_group == 0,print group 0 first ,else print group 1 first
+            for (size_t i = 0; i < layer_filaments.size(); ++i) {
+                auto& curr_layer_seq = (*layer_sequences)[i];
+                if (auto iter = custom_layer_sequence_map.find(i); iter != custom_layer_sequence_map.end()) {
+                    curr_layer_seq = iter->second;
+                    if (!curr_layer_seq.empty()) {
+                        last_group = groups[0].count(curr_layer_seq.back()) ? 0 : 1;
+                    }
+                    continue;
+                }
+                if (last_group) {
+                    curr_layer_seq.insert(curr_layer_seq.end(), temp_layer_sequence[1][i].begin(), temp_layer_sequence[1][i].end());
+                    curr_layer_seq.insert(curr_layer_seq.end(), temp_layer_sequence[0][i].begin(), temp_layer_sequence[0][i].end());
+                }
+                else {
+                    curr_layer_seq.insert(curr_layer_seq.end(), temp_layer_sequence[0][i].begin(), temp_layer_sequence[0][i].end());
+                    curr_layer_seq.insert(curr_layer_seq.end(), temp_layer_sequence[1][i].begin(), temp_layer_sequence[1][i].end());
+                }
+                last_group = !last_group;
+            }
+        }
+
+        if (nozzle_match_per_layer)
+            *nozzle_match_per_layer = nozzle_match_info;
+
+        return cost;
+    }
+#endif
+
+    int reorder_filaments_for_multi_nozzle_extruder(const std::vector<unsigned int>& filament_lists,
+        const MultiNozzleUtils::LayeredNozzleGroupResult& nozzle_group_result,
+        const std::vector<std::vector<unsigned int>>& layer_filaments,
+        const std::vector<FlushMatrix>& flush_matrix,
+        const std::function<bool(int, std::vector<int>&)> get_custom_seq,
+        std::vector<std::vector<unsigned int>>* filament_sequences,
+        const MultiNozzleUtils::NozzleStatusRecorder& initial_status)
+    {
+        std::map<int,std::set<unsigned int>> nozzle_filament_groups;
+        std::map<int,std::set<int>> extruder_to_nozzle;
+
+        for(auto filament_idx : filament_lists){
+            auto nozzle_info = nozzle_group_result.get_nozzle_for_filament(filament_idx, -1);
+            if (!nozzle_info)
+                continue;
+            nozzle_filament_groups[nozzle_info->group_id].insert(filament_idx);
+            extruder_to_nozzle[nozzle_info->extruder_id].insert(nozzle_info->group_id);
+        }
+
+        std::map<size_t, std::vector<unsigned int>>custom_layer_sequence_map;// save the filament sequences of custom layer
+        for (size_t layer = 0; layer < layer_filaments.size(); ++layer){
+            const auto& curr_lf = layer_filaments[layer];
+            std::vector<int> custom_filament_seq;
+            if (get_custom_seq && get_custom_seq(layer, custom_filament_seq) && !custom_filament_seq.empty()) {
+                std::vector<unsigned int> unsign_custom_extruder_seq;
+                for (int extruder : custom_filament_seq) {
+                    unsigned int unsign_extruder = static_cast<unsigned int>(extruder) - 1;
+                    auto it = std::find(layer_filaments[layer].begin(), layer_filaments[layer].end(), unsign_extruder);
+                    if (it != layer_filaments[layer].end())
+                        unsign_custom_extruder_seq.emplace_back(unsign_extruder);
+                }
+                assert(layer_filaments[layer].size() == unsign_custom_extruder_seq.size());
+
+                custom_layer_sequence_map[layer] = unsign_custom_extruder_seq;
+            }
+        }
+
+
+        std::map<int, std::vector<std::vector<unsigned int>>> nozzle_filament_sequences;
+        bool store_sequence = filament_sequences != nullptr;
+
+        int cost = 0;
+        for(auto& group : nozzle_filament_groups){
+            int nozzle_id = group.first;
+            auto& filament_in_nozzle = group.second;
+
+            int extruder_id = 0;
+            for(auto& [ext, nozzle_set] : extruder_to_nozzle){
+                if(nozzle_set.count(nozzle_id)){
+                    extruder_id = ext;
+                    break;
+                }
+            }
+
+            if(filament_in_nozzle.empty())
+                continue;
+            if (extruder_id < 0 || extruder_id >= static_cast<int>(flush_matrix.size()))
+                continue;
+
+            std::vector<unsigned int> filament_vec_in_nozzle(filament_in_nozzle.begin(), filament_in_nozzle.end());
+
+            const auto& extruder_flush = flush_matrix[extruder_id];
+            int initial_fil = initial_status.get_filament_in_nozzle(nozzle_id);
+            std::optional<unsigned int> initial_fil_id = (initial_fil >= 0 && initial_fil < static_cast<int>(extruder_flush.size()))? std::optional<unsigned int>(initial_fil) : std::nullopt;
+
+            std::vector<std::vector<unsigned int>> filament_seq;
+            cost += reorder_filaments_for_minimum_flush_volume_base(filament_vec_in_nozzle, layer_filaments, extruder_flush, get_custom_seq,
+                                                                    store_sequence ? &filament_seq : nullptr, initial_fil_id);
+            if(store_sequence)
+                nozzle_filament_sequences.emplace(nozzle_id, std::move(filament_seq));
+
+        }
+
+        if(!store_sequence)
+            return cost;
+
+        std::vector<int> extruders;
+        std::map<int, std::vector<int>> nozzles_per_extruder;
+        for (auto& [extruder_id, nozzle_set] : extruder_to_nozzle) {
+            extruders.push_back(extruder_id);
+            nozzles_per_extruder[extruder_id] = std::vector<int>(
+                nozzle_set.begin(), nozzle_set.end()
+            );
+        }
+
+        filament_sequences->clear();
+        filament_sequences->resize(layer_filaments.size());
+        // No filament mapped to a nozzle: keep the empty per-layer sequences.
+        // max_element on an empty extruder list is undefined and used to corrupt the heap.
+        if (extruders.empty())
+            return cost;
+
+        auto get_extruder_for_filament = [nozzle_group_result](unsigned int filament_idx) {
+            auto nozzle = nozzle_group_result.get_nozzle_for_filament(filament_idx, -1);
+            if (!nozzle)
+                return -1;
+            return nozzle->extruder_id;
+            };
+
+        auto get_nozzle_idx_for_filament = [&nozzles_per_extruder, nozzle_group_result](unsigned int filament_idx)->int {
+            auto nozzle = nozzle_group_result.get_nozzle_for_filament(filament_idx, -1);
+            if (!nozzle)
+                return -1;
+            auto ext_it = nozzles_per_extruder.find(nozzle->extruder_id);
+            if (ext_it == nozzles_per_extruder.end())
+                return -1;
+            const auto& nozzles = ext_it->second;
+            auto it = std::find(nozzles.begin(), nozzles.end(), nozzle->group_id);
+            if (it == nozzles.end())
+                return -1;
+            return static_cast<int>(std::distance(nozzles.begin(), it));
+            };
+
+        int initial_extruder = initial_status.get_current_extruder_id();
+        int last_extruder_idx = (initial_extruder >= 0 && initial_extruder < static_cast<int>(extruders.size()))? initial_extruder : 0;
+        // set size to max extruder_id in case extruder_id is not continuous
+        int max_extruder_id = *std::max_element(extruders.begin(), extruders.end());
+        std::vector<int> last_nozzle_idx(max_extruder_id >= 0 ? static_cast<size_t>(max_extruder_id) + 1 : 0, 0);
+        auto nozzle_idx_in_range = [&last_nozzle_idx](int extruder_id) {
+            return extruder_id >= 0 && extruder_id < static_cast<int>(last_nozzle_idx.size());
+        };
+        for (int ext_id = 0; ext_id < static_cast<int>(last_nozzle_idx.size()); ext_id++) {
+            auto ext_it = nozzles_per_extruder.find(ext_id);
+            if (ext_it == nozzles_per_extruder.end())
+                continue;
+            int initial_nozzle = initial_status.get_nozzle_in_extruder(ext_id);
+            const auto& ext_nozzles = ext_it->second;
+            auto it = std::find(ext_nozzles.begin(), ext_nozzles.end(), initial_nozzle);
+            if (it != ext_nozzles.end())
+                last_nozzle_idx[ext_id] = static_cast<int>(std::distance(ext_nozzles.begin(), it));
+        }
+
+        const int extruder_count = static_cast<int>(extruders.size());
+        for (size_t layer = 0; layer < layer_filaments.size(); ++layer) {
+            auto& out_seq = (*filament_sequences)[layer];
+
+            if (custom_layer_sequence_map.find(layer) != custom_layer_sequence_map.end()) {
+                out_seq = custom_layer_sequence_map[layer];
+                if (!out_seq.empty()) {
+                    int back_ext = get_extruder_for_filament(out_seq.back());
+                    if (back_ext >= 0)
+                        last_extruder_idx = back_ext;
+                    for (auto filament : out_seq) {
+                        int cur_ext_id = get_extruder_for_filament(filament);
+                        int nozzle_idx = get_nozzle_idx_for_filament(filament);
+                        // Filaments absent from this grouping have extruder -1. Writing that
+                        // index used to overwrite the vector heap header (free(): invalid pointer).
+                        if (nozzle_idx >= 0 && nozzle_idx_in_range(cur_ext_id))
+                            last_nozzle_idx[cur_ext_id] = nozzle_idx;
+                    }
+                }
+                continue;
+            }
+
+            if (last_extruder_idx < 0)
+                last_extruder_idx = 0;
+
+            int curr_last_extruder_idx = last_extruder_idx;
+            auto curr_last_nozzle_idx = last_nozzle_idx;
+            int start = last_extruder_idx % extruder_count;
+            if (start < 0)
+                start += extruder_count;
+            for (int i = 0; i < extruder_count; ++i) {
+                int extruder_id = extruders[(start + i) % extruder_count];
+                auto ext_it = nozzles_per_extruder.find(extruder_id);
+                if (ext_it == nozzles_per_extruder.end() || ext_it->second.empty())
+                    continue;
+                auto& base_nozzles = ext_it->second;
+
+                bool has_seq = false;
+                int start_nozzle_idx = 0;
+                if (nozzle_idx_in_range(extruder_id)) {
+                    if (last_nozzle_idx[extruder_id] < 0)
+                        last_nozzle_idx[extruder_id] = 0;
+                    start_nozzle_idx = last_nozzle_idx[extruder_id];
+                }
+
+                const int nozzle_count = static_cast<int>(base_nozzles.size());
+                for (int j = 0; j < nozzle_count; ++j) {
+                    int nozzle_idx = (start_nozzle_idx + j) % nozzle_count;
+                    if (nozzle_idx < 0)
+                        nozzle_idx += nozzle_count;
+                    int nozzle_id = base_nozzles[nozzle_idx];
+                    auto seq_it = nozzle_filament_sequences.find(nozzle_id);
+                    if (seq_it == nozzle_filament_sequences.end() || layer >= seq_it->second.size())
+                        continue;
+                    const auto& frag = seq_it->second[layer];
+                    if (frag.empty())
+                        continue;
+                    has_seq = true;
+                    if (nozzle_idx_in_range(extruder_id))
+                        curr_last_nozzle_idx[extruder_id] = nozzle_idx;
+                    out_seq.insert(out_seq.end(), frag.begin(), frag.end());
+                }
+
+                if (has_seq)
+                    curr_last_extruder_idx = extruder_id;
+            }
+            last_extruder_idx = curr_last_extruder_idx;
+            last_nozzle_idx = curr_last_nozzle_idx;
+        }
+        return cost;
+    }
+
 }

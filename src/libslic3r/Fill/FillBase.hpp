@@ -39,6 +39,10 @@ struct LockRegionParam
 {
     LockRegionParam() {}
     std::map<float, ExPolygons> skin_density_params;
+    std::map<float, ExPolygons> skin_depths_params;
+    std::map<float, ExPolygons> locked_depths_params;
+
+    ExPolygons outlook;
     std::map<float, ExPolygons> skeleton_density_params;
     std::map<Flow, ExPolygons>  skin_flow_params;
     std::map<Flow, ExPolygons>  skeleton_flow_params;
@@ -52,6 +56,7 @@ struct FillParams
     double      filter_out_gap_fill { 0.0 };
     // Fill density, fraction in <0, 1>
     float       density 		{ 0.f };
+    int         multiline       { 1 };
 
     // Length of an infill anchor along the perimeter.
     // 1000mm is roughly the maximum length line that fits into a 32bit coord_t.
@@ -77,6 +82,8 @@ struct FillParams
     // Layer height for Concentric infill with Arachne.
     coordf_t    layer_height    { 0.f };
 
+    InfillPattern pattern{ ipRectilinear };
+
     // BBS
     Flow            flow;
     ExtrusionRole   extrusion_role{ ExtrusionRole(0) };
@@ -90,8 +97,19 @@ struct FillParams
     bool            symmetric_infill_y_axis{false};
     coord_t         symmetric_y_axis{0};
     bool            locked_zag{false};
-    float           infill_lock_depth{0.0};
-    float           skin_infill_depth{0.0};
+    bool            conformal{false};
+    ConformalStagger conformal_stagger{ConformalStagger::None};
+    int              conformal_link_keep_layers{1};
+    int              conformal_link_flip_layers{0};
+    ConformalPole    conformal_pole{ConformalPole::Layer};
+    // 0 = auto from density / locked n; >0 = force even ray count (>= 4).
+    int              conformal_ray_count{0};
+    // 0 = auto n*1.2*line_width/(2π); >0 = mm; <0 = disable hub clip.
+    float            conformal_hub_radius{0.f};
+
+    // For 2D lattice
+    coordf_t        lattice_angle_1{0.f};
+    coordf_t        lattice_angle_2{0.f};
 };
 static_assert(IsTriviallyCopyable<FillParams>::value, "FillParams class is not POD (and it should be - see constructor).");
 
@@ -100,6 +118,9 @@ class Fill
 public:
     // Index of the layer.
     size_t      layer_id;
+    // Print-object region index; radial lock tables are keyed by this so a
+    // conformal modifier does not share n / Axis with the parent remainder.
+    size_t      lock_region_id { 0 };
     // Z coordinate of the top print surface, in unscaled coordinates
     coordf_t    z;
     // in unscaled coordinates
@@ -154,6 +175,7 @@ public:
     virtual void fill_surface_extrusion(const Surface *surface, const FillParams &params, ExtrusionEntitiesPtr &out);
     virtual void copy_fill_data(const Fill *f){
         layer_id              = f->layer_id;
+        lock_region_id        = f->lock_region_id;
         z                     = f->z;
         spacing               = f->spacing;
         overlap               = f->overlap;
@@ -209,6 +231,9 @@ public:
 
     static coord_t  _adjust_solid_spacing(const coord_t width, const coord_t distance);
 };
+
+//Fill  Multiline 
+void multiline_fill(Polylines& polylines, const FillParams& params, float spacing);
 
 } // namespace Slic3r
 

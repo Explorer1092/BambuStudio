@@ -10,8 +10,29 @@
 
 #include "wx/uri.h"
 #include "wx/mediactrl.h"
+#include <chrono>
+#ifdef __WXMAC__
+#include "Printer/LiveViewTrackContext.h"
+#define BAMBU_DYNAMIC
+#include "Printer/BambuTunnel.h"
+#endif
 
 wxDECLARE_EVENT(EVT_MEDIA_CTRL_STAT, wxCommandEvent);
+wxDECLARE_EVENT(EVT_MEDIA_CTRL_FIRST_FRAME, wxCommandEvent);
+wxDECLARE_EVENT(EVT_MEDIA_CTRL_SESSION_END, wxCommandEvent);
+
+#ifdef __WXMAC__
+struct FirstFrameInfo {
+    int     first_frame_cost_ms        = 0;
+    int64_t first_packet_time_ms       = 0;
+    int64_t decode_first_frame_time_ms = 0;
+    int64_t render_first_frame_time_ms = 0;
+    int     video_codec                = 0;
+    int     resolution_width           = 0;
+    int     resolution_height          = 0;
+};
+#endif
+
 
 void wxMediaCtrl_OnSize(wxWindow * ctrl, wxSize const & videoSize, int width, int height);
 
@@ -24,13 +45,14 @@ public:
 
     ~wxMediaCtrl2();
 
-    void Load(wxURI url);
+    void Load(wxURI url, std::chrono::system_clock::time_point play_start_time = {});
 
     void Play();
 
     void Stop();
 
-    void SetIdleImage(wxString const & image);
+    void SetIdleImage(wxString const & image, wxString const & watermark_text = {});
+    void SetIdleImage(const wxImage &image, wxString const & watermark_text = {});
 
     wxMediaState GetState() const;
 
@@ -38,7 +60,14 @@ public:
 
     int GetLastError() const { return m_error; }
 
-    static constexpr wxMediaState MEDIASTATE_BUFFERING = (wxMediaState) 6;
+    void SetConstrainByAspectRatio(bool constrain) { m_constrain_by_aspect_ratio = constrain; }
+    bool GetConstrainByAspectRatio() const { return m_constrain_by_aspect_ratio; }
+    void SuppressPauseIcon(bool suppress);
+
+    void SetTrackChannel(const BambuLiveViewTrack::ChannelInfo& info);
+    void UpdateSessionStat() {}  // data filled by session-end callback, nothing to do here
+
+    static inline wxMediaState MEDIASTATE_BUFFERING = (wxMediaState) 6;
 
 protected:
     void DoSetSize(int x, int y, int width, int height, int sizeFlags) override;
@@ -49,10 +78,44 @@ protected:
 
 private:
     void create_player();
+    void mouseWheelEvent(wxMouseEvent &evt);
+    void resetZoom();
+    void applyVideoTransform();
+    void clampZoomOffset();
+    void updateIdleLayer();
+    void updateStatusBadge();
+    void updateZoomBadge();
+    void updatePauseIconLayer();
+    void removeIdleLayer();
+
     void * m_player = nullptr;
     wxMediaState m_state = wxMEDIASTATE_STOPPED;
     int          m_error  = 0;
     wxSize       m_video_size{16, 9};
+    bool         m_constrain_by_aspect_ratio{true};
+    double       m_zoom = 1.0;
+    double       m_zoom_offset_x = 0.0;
+    double       m_zoom_offset_y = 0.0;
+    void *       m_video_layer = nullptr;
+
+    wxString m_idle_image;
+    wxString m_watermark_text;
+    void *   m_idle_layer = nullptr;      // CALayer* for idle image
+    void *   m_watermark_layer = nullptr;  // CenteredCATextLayer* for status badge text
+    void *   m_badge_bg_layer = nullptr;
+    void *   m_badge_dot_layer = nullptr;
+    void *   m_zoom_badge_bg_layer = nullptr;
+    void *   m_zoom_badge_text_layer = nullptr;
+    void *   m_pause_icon_layer = nullptr;
+    bool     m_suppress_pause_icon = false; // hide the pause placeholder from INITIALIZING onward
+
+public:
+    std::chrono::system_clock::time_point m_play_start_time;
+    FirstFrameInfo                    m_first_frame_info;
+    BambuLiveViewTrack::ChannelInfo   m_track_channel;
+    Bambu_SessionStat m_session_stat          = {};
+    int               m_video_decode_error_count = 0;
+    int               m_render_error_count       = 0;
 };
 
 #else
@@ -68,11 +131,15 @@ public:
 
     void Stop();
 
-    void SetIdleImage(wxString const & image);
+    void SetIdleImage(wxString const & image, wxString const & watermark_text = {});
+    void SetIdleImage(const wxImage &image, wxString const & watermark_text = {});
 
     int GetLastError() const;
 
     wxSize GetVideoSize() const;
+
+    void SetConstrainByAspectRatio(bool constrain) { m_constrain_by_aspect_ratio = constrain; }
+    bool GetConstrainByAspectRatio() const { return m_constrain_by_aspect_ratio; }
 
 protected:
     wxSize DoGetBestSize() const override;
@@ -90,6 +157,7 @@ private:
     int      m_error = 0;
     bool     m_loaded = false;
     wxSize   m_video_size{16, 9};
+    bool     m_constrain_by_aspect_ratio{true};
 };
 
 #endif

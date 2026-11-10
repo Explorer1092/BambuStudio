@@ -13,6 +13,8 @@
 #include <wx/animate.h>
 #include <wx/dynarray.h>
 
+#include "slic3r/GUI/DeviceCore/DevFilaSwitch.h"
+
 
 #define AMS_CONTROL_BRAND_COLOUR wxColour(0, 174, 66)
 #define AMS_CONTROL_GRAY700 wxColour(107, 107, 107)
@@ -30,29 +32,27 @@
 #define AMS_CONTROL_DEF_HUMIDITY_BK_COLOUR wxColour(238, 238, 238)
 
 
-namespace Slic3r { namespace GUI {
+namespace Slic3r
+{
+namespace GUI
+{
 
-enum AMSModel {
-    EXT_AMS             = 0,    //ext
-    GENERIC_AMS         = 1,
-    AMS_LITE            = 2,    //ams-lite
-    N3F_AMS             = 3,
-    N3S_AMS             = 4     //n3s  single_ams
-};
-
-enum AMSModelOriginType {
+enum AMSModelOriginType
+{
     GENERIC_EXT,
     LITE_EXT
 };
 
-enum ActionButton {
-    ACTION_BTN_CALI     = 0,
-    ACTION_BTN_LOAD     = 1,
-    ACTION_BTN_UNLOAD   = 2,
-    ACTION_BTN_COUNT    = 3
+enum ActionButton
+{
+    ACTION_BTN_CALI = 0,
+    ACTION_BTN_LOAD = 1,
+    ACTION_BTN_UNLOAD = 2,
+    ACTION_BTN_COUNT = 3
 };
 
-enum class AMSRoadMode : int {
+enum class AMSRoadMode : int
+{
     AMS_ROAD_MODE_LEFT,
     AMS_ROAD_MODE_LEFT_RIGHT,
     AMS_ROAD_MODE_END,
@@ -62,22 +62,29 @@ enum class AMSRoadMode : int {
     AMS_ROAD_MODE_VIRTUAL_TRAY
 };
 
-enum class AMSPanelPos : int {
-    SINGLE_PANEL,
-    LEFT_PANEL,
-    RIGHT_PANEL,
+enum class AMSPanelPos : int
+{
+    RIGHT_PANEL = 0, // equal to main extruder id
+    LEFT_PANEL = 1  // equal to deputy extruder id
 };
 
-enum class AMSRoadShowMode : int {
+enum class AMSRoadShowMode : int
+{
     AMS_ROAD_MODE_FOUR,
     AMS_ROAD_MODE_DOUBLE,
     AMS_ROAD_MODE_SINGLE,
     AMS_ROAD_MODE_SINGLE_N3S,
     AMS_ROAD_MODE_AMS_LITE,
-    AMS_ROAD_MODE_NONE
+    AMS_ROAD_MODE_ARROW,
+    AMS_ROAD_MODE_NONE,
+    // Variants of DOUBLE that only draw the AMS side when paired with an EXT_SPOOL
+    // (used when fila switch is installed and EXT's down-road should be hidden)
+    AMS_ROAD_MODE_DOUBLE_FAR_ONLY,
+    AMS_ROAD_MODE_DOUBLE_NEAR_ONLY,
 };
 
-enum class AMSPassRoadMode : int {
+enum class AMSPassRoadMode : int
+{
     AMS_ROAD_MODE_NONE,
     AMS_ROAD_MODE_LEFT,
     AMS_ROAD_MODE_LEFT_RIGHT,
@@ -86,7 +93,8 @@ enum class AMSPassRoadMode : int {
     AMS_ROAD_MODE_END_BOTTOM,
 };
 
-enum class AMSAction : int {
+enum class AMSAction : int
+{
     AMS_ACTION_NONE,
     AMS_ACTION_LOAD,
     AMS_ACTION_UNLOAD,
@@ -96,7 +104,8 @@ enum class AMSAction : int {
     AMS_ACTION_NOAMS,
 };
 
-enum class AMSPassRoadSTEP : int {
+enum class AMSPassRoadSTEP : int
+{
     AMS_ROAD_STEP_NONE = 0,
     AMS_ROAD_STEP_1 = 1, // lib -> extrusion
     AMS_ROAD_STEP_2 = 2, // extrusion->buffer
@@ -107,13 +116,15 @@ enum class AMSPassRoadSTEP : int {
     AMS_ROAD_STEP_COMBO_LOAD_STEP3,
 };
 
-enum class AMSPassRoadType : int {
+enum class AMSPassRoadType : int
+{
     AMS_ROAD_TYPE_NONE,
     AMS_ROAD_TYPE_LOAD,
     AMS_ROAD_TYPE_UNLOAD,
 };
 
-enum class AMSCanType : int {
+enum class AMSCanType : int
+{
     AMS_CAN_TYPE_NONE,
     AMS_CAN_TYPE_BRAND,
     AMS_CAN_TYPE_THIRDBRAND,
@@ -121,24 +132,11 @@ enum class AMSCanType : int {
     AMS_CAN_TYPE_VIRTUAL,
 };
 
-enum FilamentStep {
-    STEP_IDLE,
-    STEP_HEAT_NOZZLE,
-    STEP_CUT_FILAMENT,
-    STEP_PULL_CURR_FILAMENT,
-    STEP_PUSH_NEW_FILAMENT,
-    STEP_GRAB_NEW_FILAMENT,
-    STEP_PURGE_OLD_FILAMENT,
-    STEP_CONFIRM_EXTRUDED,
-    STEP_CHECK_POSITION,
-    STEP_COUNT,
-};
-
-
-enum FilamentStepType {
-    STEP_TYPE_LOAD      = 0,
-    STEP_TYPE_UNLOAD    = 1,
-    STEP_TYPE_VT_LOAD   = 2,
+enum FilamentStepType
+{
+    STEP_TYPE_LOAD = 0,
+    STEP_TYPE_UNLOAD = 1,
+    STEP_TYPE_VT_LOAD = 2,
 };
 
 #define AMS_ITEM_CUBE_SIZE wxSize(FromDIP(9), FromDIP(14))
@@ -152,6 +150,8 @@ enum FilamentStepType {
 #define AMS_LITE_CAN_LIB_SIZE wxSize(FromDIP(49), FromDIP(72))
 #define AMS_CAN_ROAD_SIZE wxSize(FromDIP(264), FromDIP(50))
 #define AMS_ITEMS_PANEL_SIZE wxSize(FromDIP(264), FromDIP(44))
+#define AMS_ITEMS_ARROW_LEFT_PANEL_SIZE wxSize(FromDIP(197), FromDIP(44))
+#define AMS_ITEMS_ARROW_RIGHT_PANEL_SIZE wxSize(FromDIP(60), FromDIP(44))
 //#define AMS_CANS_SIZE wxSize(FromDIP(284), FromDIP(184))
 //#define AMS_CANS_WINDOW_SIZE wxSize(FromDIP(264), FromDIP(196))
 #define AMS_STEP_SIZE wxSize(FromDIP(172), FromDIP(196))
@@ -175,22 +175,27 @@ enum FilamentStepType {
 struct Caninfo
 {
     std::string     can_id;
+    std::string     can_pannel_name;
     wxString        material_name;
-    wxColour        material_colour = {*wxWHITE};
+    wxString        sub_brands;
+    wxColour        material_colour = { *wxWHITE };
     AMSCanType      material_state;
-    int             ctype=0;
+    int             ctype = 0;
     int             material_remain = 100;
     int             cali_idx = -1;
     std::string     filament_id;
     float           k = 0.0f;
     float           n = 0.0f;
     std::vector<wxColour> material_cols;
+    bool            is_exist = false;
 
 public:
     bool operator==(const Caninfo& other) const
     {
         if (can_id == other.can_id &&
+            can_pannel_name == other.can_pannel_name &&
             material_name == other.material_name &&
+            sub_brands == other.sub_brands &&
             material_colour == other.material_colour &&
             material_state == other.material_state &&
             ctype == other.ctype &&
@@ -199,8 +204,7 @@ public:
             filament_id == other.filament_id &&
             k == other.k &&
             n == other.n &&
-            material_cols == other.material_cols)
-        {
+            material_cols == other.material_cols) {
             return true;
         }
 
@@ -213,58 +217,66 @@ struct AMSinfo
 public:
     std::string             ams_id;
     std::vector<Caninfo>    cans;
-    int                     nozzle_id = 0;
     std::string             current_can_id;
     AMSPassRoadSTEP         current_step = AMSPassRoadSTEP::AMS_ROAD_STEP_NONE;
     AMSAction               current_action;
     int                     curreent_filamentstep;
     int                     ams_humidity = 0;
-    int                     humidity_raw = -1;
+    int                     ams_humidity_percent = -1;
     int                     left_dray_time = 0;
     float                   current_temperature = INVALID_AMS_TEMPERATURE;
-    AMSModel                ams_type = AMSModel::GENERIC_AMS;
+    DevAmsType              ams_type = DevAmsType::AMS;
     AMSModelOriginType      ext_type = AMSModelOriginType::GENERIC_EXT;
+    bool                    m_ams_drying = false;
+
+    std::set<int>                           binded_extruder_set;
+    std::optional<int>                      current_extruder_id;
+    std::optional<DevFilaSwitch::SwitchPos> binded_switcher_pos;
+    std::set<int>                           dryable_slots;
 
 public:
     bool operator== (const AMSinfo& other) const
     {
         if (ams_id == other.ams_id &&
             cans == other.cans &&
-            nozzle_id == other.nozzle_id &&
             current_can_id == other.current_can_id &&
             current_step == other.current_step &&
             current_action == other.current_action &&
             curreent_filamentstep == other.curreent_filamentstep &&
             ams_humidity == other.ams_humidity &&
             left_dray_time == other.left_dray_time &&
+            m_ams_drying == other.m_ams_drying &&
             current_temperature == other.current_temperature &&
             ams_type == other.ams_type &&
-            ext_type == other.ext_type)
-        {
+            ext_type == other.ext_type &&
+            binded_extruder_set == other.binded_extruder_set &&
+            binded_switcher_pos == other.binded_switcher_pos &&
+            dryable_slots == other.dryable_slots) {
             return true;
         }
 
         return false;
     };
 
-    bool operator!=(const AMSinfo &other) const
+    bool operator!=(const AMSinfo& other) const
     {
-        if (operator==(other))
-        {
+        if (operator==(other)) {
             return false;
         }
 
         return true;
     };
 
-    bool parse_ams_info(MachineObject* obj, DevAms *ams, bool remain_flag = false, bool humidity_flag = false);
+    bool parse_ams_info(MachineObject* obj, DevAms* ams, bool remain_flag = false, bool humidity_flag = false);
     void parse_ext_info(MachineObject* obj, DevAmsTray tray);
 
-    bool support_drying() const { return (ams_type == AMSModel::N3S_AMS) || (ams_type == AMSModel::N3F_AMS); };
+    bool support_drying() const { return (ams_type == DevAmsType::N3S) || (ams_type == DevAmsType::N3F); };
     bool support_humidity() const { return  1 <= get_humidity_display_idx() && get_humidity_display_idx() <= 5; }
     Caninfo get_caninfo(const std::string& can_id, bool& found) const;
 
     int  get_humidity_display_idx() const;
+
+    AMSPanelPos GetDefaultPanelPos(int total_extruder_count) const;
 };
 
 /*************************************************
@@ -279,8 +291,11 @@ public:
 
     void            render(wxDC& dc);
     void            doRender(wxDC& dc);
-    AMSExtText(wxWindow* parent, wxWindowID id, const wxPoint& pos = wxDefaultPosition, const wxSize& size = wxDefaultSize);
+    AMSExtText(wxWindow* parent, const Caninfo& can_info, wxWindowID id, const wxPoint& pos = wxDefaultPosition, const wxSize& size = wxDefaultSize);
     ~AMSExtText();
+
+private:
+    Caninfo m_can_info;
 };
 
 
@@ -292,8 +307,8 @@ class AMSrefresh : public wxWindow
 {
 public:
     AMSrefresh();
-    AMSrefresh(wxWindow *parent, std::string ams_id, wxString can_id, Caninfo info, const wxPoint &pos = wxDefaultPosition, const wxSize &size = wxDefaultSize);
-    AMSrefresh(wxWindow *parent, std::string ams_id, int can_id, Caninfo info, const wxPoint &pos = wxDefaultPosition, const wxSize &size = wxDefaultSize);
+    AMSrefresh(wxWindow* parent, std::string ams_id, wxString can_id, Caninfo info, const wxPoint& pos = wxDefaultPosition, const wxSize& size = wxDefaultSize);
+    AMSrefresh(wxWindow* parent, std::string ams_id, int can_id, Caninfo info, const wxPoint& pos = wxDefaultPosition, const wxSize& size = wxDefaultSize);
     ~AMSrefresh();
 
 public:
@@ -307,20 +322,20 @@ public:
     void    msw_rescale();
 
 protected:
-    void create(wxWindow *parent, wxWindowID id, const wxPoint &pos, const wxSize &size);
+    void create(wxWindow* parent, wxWindowID id, const wxPoint& pos, const wxSize& size);
 
-    void on_timer(wxTimerEvent &event);
-    void OnEnterWindow(wxMouseEvent &evt);
-    void OnLeaveWindow(wxMouseEvent &evt);
-    void OnClick(wxMouseEvent &evt);
-    void post_event(wxCommandEvent &&event);
-    void paintEvent(wxPaintEvent &evt);
+    void on_timer(wxTimerEvent& event);
+    void OnEnterWindow(wxMouseEvent& evt);
+    void OnLeaveWindow(wxMouseEvent& evt);
+    void OnClick(wxMouseEvent& evt);
+    void post_event(wxCommandEvent&& event);
+    void paintEvent(wxPaintEvent& evt);
 
 protected:
-    wxTimer *m_playing_timer= {nullptr};
+    wxTimer* m_playing_timer = { nullptr };
     int      m_rotation_angle = 0;
-    bool             m_play_loading = {false};
-    bool             m_selected      = {false};
+    bool             m_play_loading = { false };
+    bool             m_selected = { false };
 
     std::string      m_ams_id;
     std::string      m_can_id;
@@ -339,7 +354,7 @@ protected:
     std::vector<ScalableBitmap> m_rfid_bitmap_list;
 
     wxString         m_refresh_id;
-    wxBoxSizer *     m_size_body;
+    wxBoxSizer* m_size_body;
     virtual void     DoSetSize(int x, int y, int width, int height, int sizeFlags = wxSIZE_AUTO);
 
     bool m_disable_mode{ false };
@@ -348,24 +363,45 @@ protected:
 /*************************************************
 Description:AMSextruder
 **************************************************/
-class AMSextruderImage: public wxWindow
+class AMSextruderImage : public wxWindow
 {
 public:
     void OnAmsLoading(bool load, wxColour col);
     void TurnOff();
     void setShowState(bool show_state) { m_show_state = show_state; };
     void msw_rescale();
-    void paintEvent(wxPaintEvent &evt);
+    void paintEvent(wxPaintEvent& evt);
 
-	void            render(wxDC &dc);
-    bool            m_show_state = {false};
+    void            render(wxDC& dc);
+    bool            m_show_state = { false };
     wxColour        m_colour;
     ScalableBitmap  m_ams_extruder;
     string m_file_name;
     bool            m_ams_loading{ false };
-    void            doRender(wxDC &dc);
-    AMSextruderImage(wxWindow *parent, wxWindowID id, string file_name, const wxSize& size, const wxPoint &pos = wxDefaultPosition);
+    void            doRender(wxDC& dc);
+    AMSextruderImage(wxWindow* parent, wxWindowID id, string file_name, const wxSize& size, const wxPoint& pos = wxDefaultPosition);
     ~AMSextruderImage();
+};
+
+/*************************************************
+Description:Switer
+**************************************************/
+class SwitcherImage : public wxWindow
+{
+public:
+    void setShowState(bool show_state) { m_show_state = show_state; };
+    // void msw_rescale();
+    void paintEvent(wxPaintEvent& evt);
+
+    void            render(wxDC& dc);
+    bool            m_show_state = { false };
+    wxColour        m_colour;
+    ScalableBitmap  m_switcher;
+    string m_file_name;
+    // bool            m_ams_loading{ false };
+    void            doRender(wxDC& dc);
+    SwitcherImage(wxWindow* parent, wxWindowID id, string file_name, const wxSize& size, const wxPoint& pos = wxDefaultPosition);
+    ~SwitcherImage();
 };
 
 //AMSExtImage upon ext lib
@@ -376,7 +412,7 @@ private:
     std::string m_printer_type_name;
 
     bool    m_show_ams_ext = false;
-    bool    m_show_ext     = false;
+    bool    m_show_ext = false;
 
     AMSPanelPos m_ext_pos;
     int         m_ext_num = 1;
@@ -384,19 +420,19 @@ private:
     ScalableBitmap m_ext_image;
 
 public:
-    AMSExtImage(wxWindow *parent, AMSPanelPos ext_pos, int total_ext_num, bool over_ext, wxWindowID id = wxID_ANY, const wxPoint &pos = wxDefaultPosition);
+    AMSExtImage(wxWindow* parent, AMSPanelPos ext_pos, int total_ext_num, bool over_ext, wxWindowID id = wxID_ANY, const wxPoint& pos = wxDefaultPosition);
     ~AMSExtImage();
 
     void msw_rescale();
     void setShowAmsExt(bool show);
-    void setTotalExtNum(const std::string &series_name, const std::string &printer_type, int num);
+    void setTotalExtNum(const std::string& series_name, const std::string& printer_type, int num);
 
 private:
-    void paintEvent(wxPaintEvent &evt);
-    void render(wxDC &dc);
-    void doRender(wxDC &dc);
+    void paintEvent(wxPaintEvent& evt);
+    void render(wxDC& dc);
+    void doRender(wxDC& dc);
 
-    const wxBitmap &get_bmp(const std::string &printer_type, bool is_ams_ext, AMSPanelPos pos);
+    const wxBitmap& get_bmp(const std::string& printer_type, bool is_ams_ext, AMSPanelPos pos);
 };
 
 
@@ -412,23 +448,23 @@ public:
     void OnVamsLoading(bool load, wxColour col = AMS_CONTROL_GRAY500);
     void OnAmsLoading(bool load, int nozzle_id = 0, wxColour col = AMS_CONTROL_GRAY500);
     void msw_rescale();
-    void has_ams(bool hams) {m_has_vams = hams; Refresh();};
-    void no_ams_mode(bool mode) {m_none_ams_mode = mode; Refresh();};
+    void has_ams(bool hams) { m_has_vams = hams; Refresh(); };
+    void no_ams_mode(bool mode) { m_none_ams_mode = mode; Refresh(); };
     bool updateNozzleNum(int nozzle_num, const std::string& series_name = string());
 
-    bool            m_none_ams_mode{true};
-    bool            m_has_vams{false};
-    bool            m_vams_loading{false};
-    bool            m_ams_loading{false};
+    bool            m_none_ams_mode{ true };
+    bool            m_has_vams{ false };
+    bool            m_vams_loading{ false };
+    bool            m_ams_loading{ false };
     wxColour        m_current_colur;
     wxColour        m_current_colur_deputy;
 
-    wxBoxSizer *    m_bitmap_sizer{nullptr};
-    wxPanel *       m_bitmap_panel{nullptr};
+    wxBoxSizer* m_bitmap_sizer{ nullptr };
+    wxPanel* m_bitmap_panel{ nullptr };
     //AMSextruderImage *m_amsSextruder{nullptr};
     AMSextruderImage* m_left_extruder = nullptr;
     AMSextruderImage* m_right_extruder = nullptr;
-    AMSextruder(wxWindow *parent, wxWindowID id, int nozzle_num, const wxPoint &pos = wxDefaultPosition, const wxSize &size = wxDefaultSize);
+    AMSextruder(wxWindow* parent, wxWindowID id, int nozzle_num, const wxPoint& pos = wxDefaultPosition, const wxSize& size = wxDefaultSize);
     ~AMSextruder();
 
 private:
@@ -441,7 +477,7 @@ Description:AMSLib
 class AMSLib : public wxWindow
 {
 public:
-    AMSLib(wxWindow *parent, std::string ams_idx, Caninfo info, AMSModelOriginType ext_type = AMSModelOriginType::GENERIC_EXT);
+    AMSLib(wxWindow* parent, std::string ams_idx, Caninfo info, AMSModelOriginType ext_type = AMSModelOriginType::GENERIC_EXT);
     ~AMSLib();
     void create(wxWindow* parent, wxWindowID id = wxID_ANY, const wxPoint& pos = wxDefaultPosition, const wxSize& size = wxDefaultSize);
 public:
@@ -454,7 +490,7 @@ public:
 
     int          m_can_index = 0;
     bool         transparent_changed = { false };
-    AMSModel     m_ams_model;
+    DevAmsType         m_ams_model;
     AMSModelOriginType m_ext_type = { AMSModelOriginType::GENERIC_EXT };
 
     void         Update(Caninfo info, std::string ams_idx, bool refresh = true);
@@ -462,25 +498,31 @@ public:
     void         EableSelected() { m_unable_selected = false; };
     void         OnSelected();
     void         UnSelected();
-    bool         is_selected() {return m_selected;};
-    void         post_event(wxCommandEvent &&event);
+    bool         is_selected() { return m_selected; };
+    void         post_event(wxCommandEvent&& event);
     void         show_kn_value(bool show) { m_show_kn = show; };
     void         support_cali(bool sup) { m_support_cali = sup; Refresh(); };
     virtual bool Enable(bool enable = true);
     void         set_disable_mode(bool disable) { m_disable_mode = disable; }
+    // View-only mode (2D laser/cut): show the read-only (eye) icon for every
+    // editable spool while keeping it clickable to open the view-only dialog.
+    void         set_view_only(bool view_only) { if (m_view_only != view_only) { m_view_only = view_only; Refresh(); } }
+    void         set_new_filament_hint(bool show) { if (m_show_new_filament_hint != show) { m_show_new_filament_hint = show; Refresh(); } }
     void         msw_rescale();
     void         on_pass_road(bool pass);
 
 protected:
-    wxStaticBitmap *m_edit_bitmp       = {nullptr};
-    wxStaticBitmap *m_edit_bitmp_light = {nullptr};
+    wxStaticBitmap* m_edit_bitmp = { nullptr };
+    wxStaticBitmap* m_edit_bitmp_light = { nullptr };
     ScalableBitmap  m_bitmap_editable;
     ScalableBitmap  m_bitmap_editable_light;
     ScalableBitmap  m_bitmap_readonly;
     ScalableBitmap  m_bitmap_readonly_light;
+
     ScalableBitmap  m_bitmap_transparent;
     ScalableBitmap  m_bitmap_transparent_def;
     ScalableBitmap  m_bitmap_transparent_lite;
+    wxBitmap        m_bitmap_transparent_blend;
 
     ScalableBitmap  m_bitmap_extra_tray_left;
     ScalableBitmap  m_bitmap_extra_tray_right;
@@ -494,26 +536,29 @@ protected:
     ScalableBitmap  m_bitmap_extra_tray_right_selected;
     ScalableBitmap  m_bitmap_extra_tray_mid_selected;
 
-    bool            m_unable_selected = {false};
-    bool            m_enable          = {false};
-    bool            m_selected        = {false};
-    bool            m_hover           = {false};
-    bool            m_show_kn         = {false};
-    bool            m_support_cali    = {false};
+    bool            m_unable_selected = { false };
+    bool            m_enable = { false };
+    bool            m_selected = { false };
+    bool            m_hover = { false };
+    bool            m_show_kn = { false };
+    bool            m_support_cali = { false };
 
 
-    double   m_radius = {4};
+    double   m_radius = { 4 };
     wxColour m_border_color;
     wxColour m_road_def_color;
     wxColour m_lib_color;
     bool m_disable_mode{ false };
-    bool m_pass_road{false};
+    bool m_view_only{ false };
+    bool m_pass_road{ false };
+    bool m_show_new_filament_hint{ false };
+    ScalableBitmap  m_bitmap_new_filament_hint;
 
-    void on_enter_window(wxMouseEvent &evt);
-    void on_leave_window(wxMouseEvent &evt);
-    void on_left_down(wxMouseEvent &evt);
-    void paintEvent(wxPaintEvent &evt);
-    void render(wxDC &dc);
+    void on_enter_window(wxMouseEvent& evt);
+    void on_leave_window(wxMouseEvent& evt);
+    void on_left_down(wxMouseEvent& evt);
+    void paintEvent(wxPaintEvent& evt);
+    void render(wxDC& dc);
     void render_lite_text(wxDC& dc);
     void render_generic_text(wxDC& dc);
     void doRender(wxDC& dc);
@@ -528,29 +573,30 @@ class AMSRoad : public wxWindow
 {
 public:
     AMSRoad();
-    AMSRoad(wxWindow *parent, wxWindowID id, Caninfo info, int canindex, int maxcan, const wxPoint &pos = wxDefaultPosition, const wxSize &size = wxDefaultSize);
-    void create(wxWindow *parent, wxWindowID id = wxID_ANY, const wxPoint &pos = wxDefaultPosition, const wxSize &size = wxDefaultSize);
+    AMSRoad(wxWindow* parent, wxWindowID id, Caninfo info, int canindex, int maxcan, const wxPoint& pos = wxDefaultPosition, const wxSize& size = wxDefaultSize);
+    void create(wxWindow* parent, wxWindowID id = wxID_ANY, const wxPoint& pos = wxDefaultPosition, const wxSize& size = wxDefaultSize);
 
 public:
     AMSinfo                      m_amsinfo;
     Caninfo                      m_info;
-    int                          m_canindex       = {0};
-    AMSRoadMode                  m_rode_mode      = {AMSRoadMode::AMS_ROAD_MODE_LEFT_RIGHT};
-    std::vector<AMSPassRoadMode> m_pass_rode_mode = {AMSPassRoadMode::AMS_ROAD_MODE_NONE};
-    bool                         m_selected       = {false};
-    int                          m_passroad_width = {6};
-    double                       m_radius         = {4};
+    int                          m_canindex = { 0 };
+    AMSRoadMode                  m_rode_mode = { AMSRoadMode::AMS_ROAD_MODE_LEFT_RIGHT };
+    std::vector<AMSPassRoadMode> m_pass_rode_mode = { AMSPassRoadMode::AMS_ROAD_MODE_NONE };
+    bool                         m_selected = { false };
+    int                          m_passroad_width = { 6 };
+    double                       m_radius = { 4 };
     wxColour                     m_road_def_color;
     wxColour                     m_road_color;
     void                         Update(AMSinfo amsinfo, Caninfo info, int canindex, int maxcan);
+    void                         UpdateDeviceInfo(std::weak_ptr<DevFilaSystem> fila_system);
 
     std::vector<ScalableBitmap> ams_humidity_img;
 
 
     int      m_humidity = { 0 };
     bool     m_show_humidity = { false };
-    bool     m_vams_loading{false};
-    AMSModel m_ams_model;
+    bool     m_vams_loading{ false };
+    DevAmsType m_ams_model;
 
     void OnVamsLoading(bool load, wxColour col = AMS_CONTROL_GRAY500);
     void SetPassRoadColour(wxColour col);
@@ -561,6 +607,10 @@ public:
     void paintEvent(wxPaintEvent &evt);
     void render(wxDC &dc);
     void doRender(wxDC &dc);
+
+private:
+    std::weak_ptr<DevFilaSystem> m_fila_system;
+    bool shouldHideExtRoad() const;
 };
 
 
@@ -571,11 +621,12 @@ class AMSRoadUpPart : public wxWindow
 {
 public:
     AMSRoadUpPart();
-    AMSRoadUpPart(wxWindow* parent, wxWindowID id, AMSinfo info, AMSModel mode, const wxPoint& pos = wxDefaultPosition, const wxSize& size = wxDefaultSize);
+    AMSRoadUpPart(wxWindow* parent, wxWindowID id, AMSinfo info, DevAmsType mode, const wxPoint& pos = wxDefaultPosition, const wxSize& size = wxDefaultSize);
     void create(wxWindow* parent, wxWindowID id = wxID_ANY, const wxPoint& pos = wxDefaultPosition, const wxSize& size = wxDefaultSize);
 
 public:
     void Update(AMSinfo amsinfo);
+    void UpdateDeviceInfo(std::weak_ptr<DevFilaSystem> fila_system);
 
     void OnVamsLoading(bool load, wxColour col = AMS_CONTROL_GRAY500);
     void SetPassRoadColour(wxColour col);
@@ -594,26 +645,29 @@ private:
 
     // Caninfo                      m_info;
 
-    int m_load_slot_index = {0};
-    int m_load_ams_index  = {0};
+    int m_load_slot_index = { 0 };
+    int m_load_ams_index = { 0 };
 
     // AMSRoadMode                  m_rode_mode = { AMSRoadMode::AMS_ROAD_MODE_LEFT_RIGHT };
-    std::vector<AMSPassRoadMode> m_pass_rode_mode = {AMSPassRoadMode::AMS_ROAD_MODE_NONE};
-    AMSRoadShowMode              m_road_mode      = {AMSRoadShowMode::AMS_ROAD_MODE_FOUR};
-    AMSPassRoadSTEP              m_load_step      = {AMSPassRoadSTEP::AMS_ROAD_STEP_NONE};
+    std::vector<AMSPassRoadMode> m_pass_rode_mode = { AMSPassRoadMode::AMS_ROAD_MODE_NONE };
+    AMSRoadShowMode              m_road_mode = { AMSRoadShowMode::AMS_ROAD_MODE_FOUR };
+    AMSPassRoadSTEP              m_load_step = { AMSPassRoadSTEP::AMS_ROAD_STEP_NONE };
 
-    bool     m_selected       = {false};
-    int      m_passroad_width = {6};
-    double   m_radius         = {4};
+    bool     m_selected = { false };
+    int      m_passroad_width = { 6 };
+    double   m_radius = { 4 };
     wxColour m_road_def_color;
     wxColour m_road_color;
 
     std::vector<ScalableBitmap> ams_humidity_img;
 
-    int      m_humidity      = {0};
-    bool     m_show_humidity = {false};
-    bool     m_vams_loading{false};
-    AMSModel m_ams_model;
+    int      m_humidity = { 0 };
+    bool     m_show_humidity = { false };
+    bool     m_vams_loading{ false };
+    DevAmsType m_ams_model;
+
+    std::weak_ptr<DevFilaSystem> m_fila_system;
+    bool shouldHideExtRoad() const;
 };
 
 
@@ -632,6 +686,8 @@ public:
     void UpdateLeft(int nozzle_num, AMSRoadShowMode mode);
     void UpdateRight(int nozzle_num, AMSRoadShowMode mode);
 
+    void UpdateCenter(int nozzle_num, AMSRoadShowMode mode);    void UpdateDeviceInfo(std::weak_ptr<DevFilaSystem> fila_system);
+
     void OnVamsLoading(bool load, wxColour col = AMS_CONTROL_GRAY500);
     void SetPassRoadColour(bool left, wxColour col);
     void SetShowMode(AMSRoadShowMode left_mode, AMSRoadShowMode right_mode);
@@ -644,23 +700,27 @@ public:
     void msw_rescale();
 
 private:
-    int             m_nozzle_num           = {1};
-    AMSRoadShowMode m_single_ext_rode_mode = {AMSRoadShowMode::AMS_ROAD_MODE_FOUR};
-    AMSRoadShowMode m_left_rode_mode       = {AMSRoadShowMode::AMS_ROAD_MODE_FOUR};
-    AMSRoadShowMode m_right_rode_mode      = {AMSRoadShowMode::AMS_ROAD_MODE_FOUR};
-    bool            m_selected             = {false};
+    int             m_nozzle_num = { 1 };
+    AMSRoadShowMode m_single_ext_rode_mode = { AMSRoadShowMode::AMS_ROAD_MODE_FOUR };
+    AMSRoadShowMode m_left_rode_mode = { AMSRoadShowMode::AMS_ROAD_MODE_FOUR };
+    AMSRoadShowMode m_right_rode_mode = { AMSRoadShowMode::AMS_ROAD_MODE_FOUR };
+    AMSRoadShowMode m_center_rode_mode = { AMSRoadShowMode::AMS_ROAD_MODE_AMS_LITE };
+    bool            m_selected = { false };
 
-    int             m_left_road_length     = {-1};
-    int             m_right_road_length    = {-1};
-    int             m_passroad_width       = {6};
-    double          m_radius               = {4};
-    AMSPassRoadType m_pass_road_type       = {AMSPassRoadType::AMS_ROAD_TYPE_NONE};
-    AMSPassRoadSTEP m_pass_road_left_step  = {AMSPassRoadSTEP::AMS_ROAD_STEP_NONE};
-    AMSPassRoadSTEP m_pass_road_right_step = {AMSPassRoadSTEP::AMS_ROAD_STEP_NONE};
+    int             m_left_road_length = { -1 };
+    int             m_right_road_length = { -1 };
+    int             m_passroad_width = { 6 };
+    double          m_radius = { 4 };
+    AMSPassRoadType m_pass_road_type = { AMSPassRoadType::AMS_ROAD_TYPE_NONE };
+    AMSPassRoadSTEP m_pass_road_left_step = { AMSPassRoadSTEP::AMS_ROAD_STEP_NONE };
+    AMSPassRoadSTEP m_pass_road_right_step = { AMSPassRoadSTEP::AMS_ROAD_STEP_NONE };
 
     std::map<int, wxColour> m_road_color;
-    bool m_vams_loading{false};
-    AMSModel m_ams_model;
+    bool m_vams_loading{ false };
+    DevAmsType m_ams_model;
+
+    std::weak_ptr<DevFilaSystem> m_fila_system;
+    bool shouldHideExtRoad() const;
 };
 
 /*************************************************
@@ -669,26 +729,24 @@ Description:AMSPreview
 class AMSPreview : public wxWindow
 {
 public:
-    AMSPreview();
-    AMSPreview(wxWindow *parent, wxWindowID id, AMSinfo amsinfo, AMSModel itemType = AMSModel::GENERIC_AMS, const wxPoint& pos = wxDefaultPosition, const wxSize& size = wxDefaultSize);
+    AMSPreview(wxWindow* parent, wxWindowID id, AMSinfo amsinfo, const wxPoint& pos = wxDefaultPosition, const wxSize& size = wxDefaultSize);
 
-    bool m_open = {false};
+    bool m_open = { false };
     void Open();
     void Close();
 
     void         Update(AMSinfo amsinfo);
-    void         create(wxWindow *parent, wxWindowID id, const wxPoint &pos, const wxSize &size);
-    void         OnEnterWindow(wxMouseEvent &evt);
-    void         OnLeaveWindow(wxMouseEvent &evt);
+    void         create(wxWindow* parent, wxWindowID id, const wxPoint& pos, const wxSize& size);
+    void         OnEnterWindow(wxMouseEvent& evt);
+    void         OnLeaveWindow(wxMouseEvent& evt);
     void         OnSelected();
     void         UnSelected();
     virtual bool Enable(bool enable = true);
     void         msw_rescale();
     bool         IsSelected() const;
 
-
+    DevAmsType   get_ams_type() const { return m_ams_item_type; }
     std::string  get_ams_id() const { return m_amsinfo.ams_id; };
-    int          get_nozzle_id() const { return m_amsinfo.nozzle_id; };
 
 protected:
     AMSinfo  m_amsinfo;
@@ -697,9 +755,9 @@ protected:
     wxColour m_background_colour = { AMS_CONTROL_DEF_LIB_BK_COLOUR };
     float    m_padding;
     float    m_space;
-    bool     m_hover             = {false};
-    bool     m_selected          = {false};
-    AMSModel m_ams_item_type = AMSModel::GENERIC_AMS;
+    bool     m_hover = { false };
+    bool     m_selected = { false };
+    DevAmsType m_ams_item_type = DevAmsType::AMS;
 
     ScalableBitmap m_ts_bitmap_cube;
     ScalableBitmap m_ts_bitmap_cube_dark;
@@ -707,10 +765,15 @@ protected:
     ScalableBitmap m_four_slot_bitmap_dark;
     ScalableBitmap m_single_slot_bitmap;
     ScalableBitmap m_single_slot_bitmap_dark;
+    bool           m_bitmaps_dark = false; // theme the bitmaps above were recoloured for
 
-    void         paintEvent(wxPaintEvent &evt);
-    void         render(wxDC &dc);
-    void         doRender(wxDC &dc);
+    void         paintEvent(wxPaintEvent& evt);
+    void         render(wxDC& dc);
+    void         doRender(wxDC& dc);
+    void         load_bitmaps();
+
+private:
+    void renderMultiRowGrid(wxDC& dc, const wxSize& size);
 };
 
 
@@ -741,7 +804,7 @@ public:
     ScalableBitmap ams_drying_img;
 
     bool     m_vams_loading{ false };
-    AMSModel m_ams_model;
+    DevAmsType m_ams_model;
 
     void paintEvent(wxPaintEvent& evt);
     void render(wxDC& dc);
@@ -759,11 +822,11 @@ Description:AmsItem
 class AmsItem : public wxWindow
 {
 public:
-    AmsItem();
-    AmsItem(wxWindow *parent, AMSinfo info, AMSModel model, AMSPanelPos pos);
+    AmsItem(wxWindow* parent, AMSinfo info, DevAmsType model, AMSPanelPos pos);
     ~AmsItem();
 
     void     Update(AMSinfo info);
+    void     UpdateDeviceInfo(std::weak_ptr<DevFilaSystem> fila_system);
     void     create(wxWindow *parent);
     void     AddCan(Caninfo caninfo, int canindex, int maxcan, wxBoxSizer* sizer);
     void     AddLiteCan(Caninfo caninfo, int canindex, wxGridSizer* sizer);
@@ -772,6 +835,7 @@ public:
     void     PlayRridLoading(wxString canid);
     void     StopRridLoading(wxString canid);
     void     msw_rescale();
+    bool     ShowRoad(bool show);
     void     show_sn_value(bool show);
     void     SetAmsStepExtra(wxString canid, AMSPassRoadType type, AMSPassRoadSTEP step);
     void     SetAmsStep(std::string amsid, std::string canid, AMSPassRoadType type, AMSPassRoadSTEP step);
@@ -787,19 +851,19 @@ public:
     AMSinfo             get_ams_info() const { return m_info; };
 
     std::string         get_ams_id() const { return m_info.ams_id; };
-    AMSModel            get_ams_model() const { return m_info.ams_type; };
+    DevAmsType            get_ams_model() const { return m_info.ams_type; };
 
     AMSModelOriginType  get_ext_type() const { return m_info.ext_type; };
-    AMSExtImage        *get_ext_image() const { return m_ext_image; };
+    AMSExtImage* get_ext_image() const { return m_ext_image; };
 
     size_t                         get_can_count() const { return m_info.cans.size(); };
     std::map<std::string, AMSLib*> get_can_lib_list() const { return m_can_lib_list; };
 
-    int  get_selection() const { return m_selection; };
-    void set_selection(int selection) { m_selection = selection; };
+    wxSimplebook* get_parent_book() const { return m_parent_book; };
+    std::optional<int> get_parent_book_index() const { return m_parent_book_page_index; };
+    void set_parent_book_idx(wxSimplebook* book, int book_idx) { m_parent_book = book;  m_parent_book_page_index = book_idx; };
 
     AMSPanelPos get_panel_pos() const { return m_panel_pos; };
-    int         get_nozzle_id() const { return m_info.nozzle_id; };
 
 private:
     ScalableBitmap  m_bitmap_extra_framework;
@@ -807,7 +871,10 @@ private:
     int             m_selection = { 0 };
     int             m_can_count = { 0 };
 
-    AMSModel        m_ams_model;
+    wxSimplebook* m_parent_book = { nullptr };
+    std::optional<int> m_parent_book_page_index;
+
+    DevAmsType        m_ams_model;
     AMSPanelPos     m_panel_pos;
     std::string     m_canlib_id;
 
@@ -821,15 +888,117 @@ private:
     AMSHumidity* m_humidity = { nullptr };
 
     AMSinfo         m_info;
-    wxBoxSizer *    sizer_can = {nullptr};
-    wxGridSizer*    sizer_can_extra = { nullptr };
-    wxBoxSizer *    sizer_humidity = { nullptr };
-    wxBoxSizer *    sizer_item = { nullptr };
-    wxBoxSizer *    sizer_can_middle = {nullptr};
-    wxBoxSizer *    sizer_can_left = {nullptr};
-    wxBoxSizer *    sizer_can_right = {nullptr};
-    AMSExtImage*    m_ext_image = { nullptr };      //the ext image upon the ext ams
+    wxBoxSizer* sizer_can = { nullptr };
+    wxGridSizer* sizer_can_extra = { nullptr };
+    wxBoxSizer* sizer_humidity = { nullptr };
+    wxBoxSizer* sizer_item = { nullptr };
+    wxBoxSizer* sizer_can_middle = { nullptr };
+    wxBoxSizer* sizer_can_left = { nullptr };
+    wxBoxSizer* sizer_can_right = { nullptr };
+    AMSExtImage* m_ext_image = { nullptr };      //the ext image upon the ext ams
     AMSExtText* m_ext_text = { nullptr };       //the ext text upon the ext ams
+};
+
+enum class DevExtruderState
+{
+    FILLED_LOAD,
+    FILLED_UNLOAD,
+    EMPTY_LOAD,
+    EMPTY_UNLOAD
+};
+
+class DevExtruderImage : public wxWindow
+{
+    ScalableBitmap* m_left_extruder_active_filled;
+    ScalableBitmap* m_left_extruder_active_empty;
+    ScalableBitmap* m_left_extruder_unactive_filled;
+    ScalableBitmap* m_left_extruder_unactive_empty;
+    ScalableBitmap* m_right_extruder_active_filled;
+    ScalableBitmap* m_right_extruder_active_empty;
+    ScalableBitmap* m_right_extruder_unactive_filled;
+    ScalableBitmap* m_right_extruder_unactive_empty;
+
+    ScalableBitmap* m_extruder_single_nozzle_empty_load;
+    ScalableBitmap* m_extruder_single_nozzle_empty_unload;
+    ScalableBitmap* m_extruder_single_nozzle_filled_load;
+    ScalableBitmap* m_extruder_single_nozzle_filled_unload;
+
+    DevExtruderState m_left_ext_state = { DevExtruderState::EMPTY_LOAD };
+    DevExtruderState m_right_ext_state = { DevExtruderState::EMPTY_LOAD };
+    DevExtruderState m_single_ext_state = { DevExtruderState::EMPTY_LOAD };
+
+public:
+    DevExtruderImage(wxWindow* parent, wxWindowID id,
+                     int extruder_num,
+                     const wxPoint& pos = wxDefaultPosition,
+                     const wxSize& size = wxDefaultSize);
+    ~DevExtruderImage()
+    {
+
+    }
+    void update(DevExtruderState single_state)
+    {
+        m_single_ext_state = single_state;
+    }
+    void update(DevExtruderState left_state, DevExtruderState right_state)
+    {
+        m_left_ext_state = left_state;
+        m_right_ext_state = right_state;
+    }
+
+    void msw_rescale();
+    void setExtruderCount(int extruder_num)
+    {
+        m_extruder_num = extruder_num;
+    }
+    void setExtruderUsed(const std::string& loc)
+    {
+        if (current_extruder_loc == loc) { return; }
+        current_extruder_loc = loc;
+        Refresh();
+    }
+private:
+    void paintEvent(wxPaintEvent& evt)
+    {
+        wxPaintDC dc(this);
+        render(dc);
+    }
+    void render(wxDC& dc);
+    void   doRender(wxDC& dc);
+    int m_extruder_num = 1;
+    std::string current_extruder_loc = "";
+
+};
+
+class FeedDirectionDialog : public wxDialog
+{
+public:
+    FeedDirectionDialog(wxWindow* parent, const int extruderNum, const std::string& printer_type = "");
+
+    std::optional<int> GetExtruderID();
+
+    void SetExtruderMapping(MachineObject* obj,
+                            const std::string& currAmsId,
+                            const std::string& currSlotId,
+                            const std::vector<std::pair<std::string, std::string>>& extruderSlots);
+
+private:
+    static wxString calcTrayName(MachineObject* obj, const std::string& amsID, const std::string& slotID);
+
+    int m_extruder_num{};
+    std::string m_printer_type;
+    wxString m_filament_id{};
+    wxRadioButton* m_radioHelper{nullptr};
+    wxRadioButton* m_leftRadio{nullptr};
+    wxRadioButton* m_rightRadio{nullptr};
+    wxRadioButton* m_lastChecked{nullptr};
+    DevExtruderImage* m_extruderImage{nullptr};
+    Button* m_confirmBtn{nullptr};
+    std::optional<int> m_load_extruder_id = std::nullopt;
+
+    void OnConfirm(wxCommandEvent& event);
+    void OnRadioClicked(wxCommandEvent& evt);
+
 };
 
 wxDECLARE_EVENT(EVT_AMS_EXTRUSION_CALI, wxCommandEvent);
@@ -849,7 +1018,9 @@ wxDECLARE_EVENT(EVT_AMS_UNSELETED_VAMS, wxCommandEvent);
 wxDECLARE_EVENT(EVT_AMS_UNSELETED_AMS, wxCommandEvent);
 wxDECLARE_EVENT(EVT_VAMS_ON_FILAMENT_EDIT, wxCommandEvent);
 wxDECLARE_EVENT(EVT_AMS_SWITCH, SimpleEvent);
+wxDECLARE_EVENT(EVT_AMS_NEW_FILAMENT_HINT, wxCommandEvent);
 
-}} // namespace Slic3r::GUI
+}
+} // namespace Slic3r::GUI
 
 #endif // !slic3r_GUI_amscontrol_hpp_

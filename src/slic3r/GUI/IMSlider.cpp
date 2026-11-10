@@ -1,11 +1,14 @@
 #include "IMSlider.hpp"
 #include "libslic3r/GCode.hpp"
+#include "libslic3r/PrintConfig.hpp"
 #include "GUI_App.hpp"
+#include "Plater.hpp"
 #include "NotificationManager.hpp"
 #ifndef IMGUI_DEFINE_MATH_OPERATORS
 #define IMGUI_DEFINE_MATH_OPERATORS
 #endif
 #include <imgui/imgui_internal.h>
+#include "libslic3r/Log.hpp"
 
 namespace Slic3r {
 
@@ -61,7 +64,7 @@ bool check_color_change(PrintObject *object, size_t frst_layer_id, size_t layers
 }
 
 
-static std::string gcode(Type type)
+static std::string gcode_type(Type type)
 {
     Slic3r::DynamicPrintConfig config = wxGetApp().preset_bundle->full_config();
     switch (type) {
@@ -201,6 +204,7 @@ void IMSlider::SetMaxValue(const int max_value)
 void IMSlider::SetSliderValues(const std::vector<double> &values)
 {
     m_values = values;
+    m_layers_values.clear();
 }
 
 Info IMSlider::GetTicksValues() const
@@ -238,11 +242,15 @@ void IMSlider::SetTicksValues(const Info &custom_gcode_per_print_z)
         if (tick >= 0) m_ticks.ticks.emplace(TickCode{tick, h.type, h.extruder, h.color, h.extra});
     }
 
-    if (!was_empty && m_ticks.empty())
+    if (!was_empty && m_ticks.empty()) {
         // Switch to the "Feature type"/"Tool" from the very beginning of a new object slicing after deleting of the old one
-        ;// post_ticks_changed_event();
+        // post_ticks_changed_event();
+    }
 
-    if (m_ticks.has_tick_with_code(ToolChange) && !m_can_change_color) {
+    const bool tool_change_disabled =
+        !m_can_change_color ||
+        multi_nozzle_diameter_mode_enabled(wxGetApp().preset_bundle->project_config);
+    if (m_ticks.has_tick_with_code(ToolChange) && tool_change_disabled) {
         if (!wxGetApp().plater()->only_gcode_mode() && !wxGetApp().plater()->using_exported_file())
         {
             m_ticks.erase_all_ticks_with_code(ToolChange);
@@ -289,7 +297,7 @@ void IMSlider::SetLayersTimes(const std::vector<float> &layers_times, float tota
 
     // Erase duplicates values from m_values and save it to the m_layers_values
     // They will be used for show the correct estimated time for MM print, when "No sparce layer" is enabled
-    if (m_is_wipe_tower && m_values.size() != m_layers_times.size()) {
+    if (m_is_wipe_tower && m_values.size() != m_layers_times.size() || m_layers_values.empty()) {
         m_layers_values = m_values;
         sort(m_layers_values.begin(), m_layers_values.end());
         m_layers_values.erase(unique(m_layers_values.begin(), m_layers_values.end()), m_layers_values.end());
@@ -379,6 +387,9 @@ void IMSlider::add_custom_gcode(std::string custom_gcode)
 void IMSlider::add_code_as_tick(Type type, int selected_extruder)
 {
     if (m_selection == ssUndef) return;
+    if (type == ToolChange &&
+        multi_nozzle_diameter_mode_enabled(wxGetApp().preset_bundle->project_config))
+        return;
     const int tick = m_selection == ssLower ? m_lower_value : m_higher_value;
 
     if (!check_ticks_changed_event(type)) {
@@ -386,7 +397,7 @@ void IMSlider::add_code_as_tick(Type type, int selected_extruder)
         return;
     }
 
-    if (type == ColorChange && gcode(ColorChange).empty()) GUI::wxGetApp().plater()->get_notification_manager()->push_notification(GUI::NotificationType::EmptyColorChangeCode);
+    if (type == ColorChange && gcode_type(ColorChange).empty()) GUI::wxGetApp().plater()->get_notification_manager()->push_notification(GUI::NotificationType::EmptyColorChangeCode);
 
     const int  extruder = selected_extruder > 0 ? selected_extruder : std::max<int>(1, m_only_extruder);
     const auto it       = m_ticks.ticks.find(TickCode{tick});
@@ -443,11 +454,36 @@ bool IMSlider::switch_one_layer_mode()
     if (m_show_custom_gcode_window)
         return false;
 
-    m_is_one_layer = !m_is_one_layer;
     if (!m_is_one_layer) {
-        SetLowerValue(m_min_value);
-        SetHigherValue(m_max_value);
+        m_pre_one_layer_lower  = m_lower_value;
+        m_pre_one_layer_higher = m_higher_value;
+        m_is_one_layer         = true;
+    } else {
+        m_is_one_layer = false;
+        // In one-layer mode both handles sit on the same tick; the selected handle
+        // is the one the user was driving (top = ssHigher, bottom = ssLower).
+        const int current = (m_selection == ssLower) ? m_lower_value : m_higher_value;
+
+        int restore_lower  = m_pre_one_layer_lower;
+        int restore_higher = m_pre_one_layer_higher;
+        if (restore_lower < m_min_value || restore_higher > m_max_value || restore_lower > restore_higher) {
+            restore_lower  = m_min_value;
+            restore_higher = m_max_value;
+        }
+
+        if (m_selection == ssLower) {
+            m_lower_value  = current;
+            m_higher_value = std::max(current, restore_higher);
+        } else {
+            m_higher_value = current;
+            m_lower_value  = std::min(current, restore_lower);
+        }
+        m_lower_value  = std::max(m_lower_value, m_min_value);
+        m_higher_value = std::min(m_higher_value, m_max_value);
+        if (m_lower_value > m_higher_value)
+            m_lower_value = m_higher_value;
     }
+
     m_selection == ssLower ? correct_lower_value() : correct_higher_value();
     if (m_selection == ssUndef) m_selection = ssHigher;
     set_as_dirty();
@@ -808,13 +844,13 @@ void IMSlider::show_tooltip(const TickCode& tick){
     case CustomGCode::ColorChange:
         break;
     case CustomGCode::PausePrint:
-        show_tooltip(_u8L("Pause:") + " \"" + gcode(PausePrint) + "\"" + time_str);
+        show_tooltip(_u8L("Pause:") + " \"" + gcode_type(PausePrint) + "\"" + time_str);
         break;
     case CustomGCode::ToolChange:
         show_tooltip(_u8L("Change Filament") + time_str);
         break;
     case CustomGCode::Template:
-        show_tooltip(_u8L("Custom Template:") + " \"" + gcode(Template) + "\"" + time_str);
+        show_tooltip(_u8L("Custom Template:") + " \"" + gcode_type(Template) + "\"" + time_str);
         break;
     case CustomGCode::Custom:
         show_tooltip(_u8L("Custom G-code:") + " \"" + tick.extra + "\"" + time_str);
@@ -1109,6 +1145,9 @@ bool IMSlider::render(int canvas_width, int canvas_height)
         if (ImGui::ImageButton3(normal_id, hover_id, ONE_LAYER_BUTTON_SIZE * m_scale)) {
             switch_one_layer_mode();
         }
+        if (ImGui::IsItemHovered()) {
+            show_tooltip(_u8L("Toggle path view to current layer/all layers"));
+        }
         imgui.end();
     }
 
@@ -1148,9 +1187,9 @@ void IMSlider::render_input_custom_gcode(std::string custom_gcode)
             set_focus = false;
         }
         if (set_focus && !ImGui::IsAnyItemActive() && !ImGui::IsMouseClicked(0)) {
-            wxGetApp().plater()->get_current_canvas3D()->force_set_focus();
+            if (m_request_canvas_focus) m_request_canvas_focus();
             ImGui::SetKeyboardFocusHere(0);
-            strcpy(m_custom_gcode, custom_gcode.c_str());
+            snprintf(m_custom_gcode, sizeof(m_custom_gcode), "%s", custom_gcode.c_str());
         }
         const int text_height = 6;
         const ImGuiInputTextFlags flag  = ImGuiInputTextFlags_Multiline;
@@ -1196,7 +1235,7 @@ void IMSlider::render_input_custom_gcode(std::string custom_gcode)
 }
 
 void IMSlider::do_go_to_layer(size_t layer_number) {
-    clamp((int)layer_number, m_min_value, m_max_value);
+    // SetLowerValue / SetHigherValue clamp to [m_min_value, m_max_value] internally.
     GetSelection() == ssLower ? SetLowerValue(layer_number) : SetHigherValue(layer_number);
 }
 
@@ -1230,7 +1269,7 @@ void IMSlider::render_go_to_layer_dialog()
             set_focus = false;
         }
         if (set_focus && !ImGui::IsAnyItemActive() && !ImGui::IsMouseClicked(0)) {
-            wxGetApp().plater()->get_current_canvas3D()->force_set_focus();
+            if (m_request_canvas_focus) m_request_canvas_focus();
             ImGui::SetKeyboardFocusHere(0);
         }
         ImGui::InputText("##input_layer_number", m_layer_number, sizeof(m_layer_number));
@@ -1328,7 +1367,7 @@ void IMSlider::render_add_menu()
             }
             if (hovered) { show_tooltip(_u8L("Insert custom G-code at the beginning of this layer.")); }
 
-            if (!gcode(Template).empty()) {
+            if (!gcode_type(Template).empty()) {
                 if (menu_item_with_icon(_u8L("Add Custom Template").c_str(), "", ImVec2(0, 0), 0, false, menu_item_enable, &hovered)) {
                     add_code_as_tick(Template);
                 }
@@ -1342,7 +1381,10 @@ void IMSlider::render_add_menu()
 
         //BBS render this menu item only when extruder_num > 1
         if (extruder_num > 1) {
-            if (!m_can_change_color) {
+            const bool can_change_filament =
+                m_can_change_color &&
+                !multi_nozzle_diameter_mode_enabled(wxGetApp().preset_bundle->project_config);
+            if (!can_change_filament) {
                 begin_menu(_u8L("Change Filament").c_str(), false);
             }
             else if (begin_menu(_u8L("Change Filament").c_str())) {
@@ -1375,7 +1417,7 @@ void IMSlider::render_edit_menu(const TickCode& tick)
             }
             break;
         case CustomGCode::Template:
-            if (!gcode(Template).empty()) {
+            if (!gcode_type(Template).empty()) {
                 if (menu_item_with_icon(_u8L("Delete Custom Template").c_str(), "")) {
                     delete_tick(tick);
                 }
@@ -1392,7 +1434,10 @@ void IMSlider::render_edit_menu(const TickCode& tick)
         case CustomGCode::ToolChange: {
             int extruder_num = m_extruder_colors.size();
             if (extruder_num > 1) {
-                if (!m_can_change_color) {
+                const bool can_change_filament =
+                    m_can_change_color &&
+                    !multi_nozzle_diameter_mode_enabled(wxGetApp().preset_bundle->project_config);
+                if (!can_change_filament) {
                     begin_menu(_u8L("Change Filament").c_str(), false);
                 }
                 else if (begin_menu(_u8L("Change Filament").c_str())) {
@@ -1518,7 +1563,7 @@ std::string IMSlider::get_label(int tick, LabelType label_type)
     const size_t value = tick;
 
     if (m_label_koef == 1.0 && m_values.empty()) {
-        std::to_string(value);
+        return std::to_string(value);
     }
     if (value >= m_values.size()) return "error";
 
@@ -1540,6 +1585,9 @@ std::string IMSlider::get_label(int tick, LabelType label_type)
     } else {
         if (label_type == ltEstimatedTime) {
             if (m_is_wipe_tower) {
+                // Per-tick times follow print order, so index them directly instead of merging repeated Z values.
+                if (m_layers_times.size() == m_values.size())
+                    return value < m_layers_times.size() ? short_and_splitted_time(get_time_dhms(m_layers_times[value])) : "";
                 size_t layer_number = get_layer_number(value, label_type);
                 return (layer_number == size_t(-1) || layer_number == m_layers_times.size()) ? "" : short_and_splitted_time(get_time_dhms(m_layers_times[layer_number]));
             }

@@ -24,15 +24,21 @@ enum class SLAGizmoEventType : unsigned char;
 //1.0 mean v1.10 bambu version
 //1.1 mean v2.0 v2.1 bambu version(202505)
 //2.0 mean v2.2 bambu version(202507)
-//2.2 mean v2.2 bambu version(20250815)
+//2.2 mean v2.2 bambu version(20250815) fix char gap of text
+// 2.3 mean v2.3 bambu version(20250826) add custom boldness and skew
+//2.5 mean v2.3 bambu version(20251130) fix text more accurate layout
+//2.8 mean v2.8 bambu version(20260917) add multi line text functiont
 const std::string NEW_FONT_BEGIN_VERSION  = "2.0";
-const std::string CUR_FONT_VERSION = "2.2";
+const std::string CUR_FONT_VERSION        = "2.8";
 class GLGizmoText : public GLGizmoBase
 {
 private:
     bool  m_is_direct_create_text = false;
     std::vector<Transform3d> m_trafo_matrices;//Need to correspond m_c->raycaster()->raycasters
     int m_show_calc_meshtod = 0;//1 preview //2 draging
+    size_t m_debug_line_idx      = 0; // show_text_cs: text line shown in the debug panel
+    size_t m_debug_lines_version = 0; // version of GenerateTextJob::debug_lines held by m_lines_mark
+    GLModel m_text_normal_lines_mark;
     std::vector<std::string> m_avail_font_names;
     std::string   m_text{""};
     std::string   m_font_name;
@@ -44,7 +50,9 @@ private:
     const float m_font_size_max     = 1000.f;
     bool m_warning_font      = false;
     bool m_bold = true;
+    float m_custom_boldness  = 0.f;
     bool m_italic = false;
+    float m_custom_skew   = 0.f;
     float m_thickness = 2.f;
     const float  m_thickness_min     = 0.1f;
     const float  m_thickness_max     = 1000.f;
@@ -52,6 +60,7 @@ private:
     const float  m_embeded_depth_max = 1000.f;
     float m_rotate_angle = 0;
     float m_text_gap = 0.f;
+    float m_line_gap = 0.f; // [mm] extra space between text lines
     TextConfiguration  m_ui_text_configuration;
     TextInfo::TextType m_surface_type{TextInfo::TextType ::SURFACE};
     bool m_really_use_surface_calc = false;
@@ -86,6 +95,8 @@ private:
 
     bool m_need_update_text = false;
     bool m_need_update_tran = false;
+    // Parameters already include the text volume scale. The matrix is normalized on the next rebuild.
+    bool m_text_scale_absorbed = false;
     bool m_reedit_text      = false;
     bool m_show_warning_text_create_fail = false;
     bool m_show_text_normal_error = false;
@@ -145,6 +156,9 @@ private:
     // move gizmo
     Grabber m_move_grabber;
     const int m_move_cube_id = 1;
+    // World point the cube was grabbed at. A text without host mesh drags inside the horizontal
+    // plane through this point, so the object keeps the height it had when the drag started.
+    Vec3d m_cube_drag_start_pos{Vec3d::Zero()};
     // Rotation gizmo
     GLGizmoRotate        m_rotate_gizmo;
     std::optional<float> m_distance;
@@ -155,6 +169,8 @@ private:
 
     float m_rotate_angle_min_max = 0.f;
     float m_text_gap_min_max     = 0.f;
+    float m_text_boldness_min_max     = 0.f;
+    float m_text_skew_min_max     = 0.f;
 
 public:
     GLGizmoText(GLCanvas3D& parent, unsigned int sprite_id);
@@ -187,6 +203,8 @@ protected:
     virtual void on_start_dragging() override;
     virtual void on_stop_dragging() override;
     virtual void on_update(const UpdateData &data) override;
+    Vec3d mouse_to_drag_plane(const Linef3 &mouse_ray, const Vec3d &start_position_3D) const;
+    void drag_only_text_in_bed_plane(const UpdateData &data);
     void push_combo_style(const float scale);
     void pop_combo_style();
     void push_button_style(bool pressed);
@@ -210,6 +228,7 @@ private:
     void draw_font_list();
     void draw_height(bool use_inch = false);
     void draw_depth(bool use_inch);
+    void   draw_advanced(float caption_size, float slider_width, float slider_icon_width, float drag_left_width);
     void init_font_name_texture();
     void reinit_text_lines(unsigned count_lines = 0);
     bool   check(ModelVolumeType volume_type);
@@ -236,8 +255,8 @@ private:
     void draw_style_save_as_popup();
     void draw_style_add_button(bool is_modified);
     void draw_delete_style_button();
-    void update_boldness();
-    void update_italic();
+    void update_default_boldness();
+    void update_default_italic();
     void set_default_boldness(std::optional<float> &boldness);
     void draw_model_type(int caption_width);
     void draw_surround_type(int caption_width);
@@ -260,6 +279,8 @@ private:
     bool get_is_dragging();
     bool get_selection_is_text();
     bool update_text_tran_in_model_object(bool rewrite_text_tran = false);
+    bool absorb_text_scale_into_parameters();
+    void normalize_absorbed_text_scale();
     void update_trafo_matrices();
     void update_cut_plane_dir();
     void switch_text_type(TextInfo::TextType type);

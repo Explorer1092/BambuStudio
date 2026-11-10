@@ -2,6 +2,8 @@
 
 #include <assert.h>
 
+#include "libslic3r/Log.hpp"
+
 extern "C"
 {
     #include <libavutil/avutil.h>
@@ -28,12 +30,12 @@ int AVVideoDecoder::open(Bambu_StreamInfo const &info)
     auto codec_id = info.sub_type == AVC1 ? AV_CODEC_ID_H264 : AV_CODEC_ID_MJPEG;
     auto codec    = avcodec_find_decoder(codec_id);
     if (codec == nullptr) {
-        fprintf(stderr, "AVVideoDecoder: unsupported codec!\n");
+        BOOST_LOG_TRIVIAL(error) << "unsupported codec!";
         return -1; // Codec not found
     }
     /* open the coderc */
     if (avcodec_open2(codec_ctx_, codec, nullptr) < 0) {
-        fprintf(stderr, "AVVideoDecoder: could not open codec\n");
+        BOOST_LOG_TRIVIAL(error) << "could not open codec";
         return -1;
     }
 
@@ -43,6 +45,26 @@ int AVVideoDecoder::open(Bambu_StreamInfo const &info)
         return -1;
 
     return 0;
+}
+
+int AVVideoDecoder::reopen(Bambu_StreamInfo const &info)
+{
+    if (sws_ctx_) {
+        sws_freeContext(sws_ctx_);
+        sws_ctx_ = nullptr;
+    }
+    if (frame_)
+        av_frame_free(&frame_);
+    if (codec_ctx_)
+        avcodec_free_context(&codec_ctx_);
+
+    got_frame_ = false;
+    width_     = 0; // force bits_ zero-fill on next scale (new dimensions)
+
+    codec_ctx_ = avcodec_alloc_context3(nullptr);
+    if (codec_ctx_ == nullptr)
+        return -1;
+    return open(info);
 }
 
 int AVVideoDecoder::decode(const Bambu_Sample &sample)
@@ -91,18 +113,16 @@ bool AVVideoDecoder::toWxImage(wxImage &image, wxSize const &size2)
     if (!size1.IsFullySpecified())
         size1 = {frame_->width, frame_->height };
     auto size = size1;
-    if (size.GetWidth() & 0x0f) {
+    if (size.GetWidth() & 0x0f)
         size.SetWidth((size.GetWidth() & ~0x0f) + 0x10);
-        if (size.GetWidth() != width_) {
-            std::fill(bits_.begin(), bits_.end(), 0);
-            width_ = size.GetWidth();
-        }
+    if (size.GetWidth() != width_) {
+        std::fill(bits_.begin(), bits_.end(), 0);
+        width_ = size.GetWidth();
     }
     AVPixelFormat wxFmt = AV_PIX_FMT_RGB24;
     sws_ctx_   = sws_getCachedContext(sws_ctx_,
                                     frame_->width, frame_->height, AVPixelFormat(frame_->format),
-                                    size1.GetWidth(), size1.GetHeight(), wxFmt,
-                                    SWS_GAUSS,
+                                    size1.GetWidth(), size1.GetHeight(), wxFmt, SWS_FAST_BILINEAR,
                                     nullptr, nullptr, nullptr);
     if (sws_ctx_ == nullptr)
         return false;
@@ -117,7 +137,7 @@ bool AVVideoDecoder::toWxImage(wxImage &image, wxSize const &size2)
     }
     image = wxImage(size.GetWidth(), size.GetHeight(), bits_.data(), true);
     if (!image.IsOk()) {
-        fprintf(stderr, "AVVideoDecoder: image not ok %dx%d\n", size.GetWidth(), size.GetHeight());
+        BOOST_LOG_TRIVIAL(warning) << "image not ok " << size.GetWidth() << "x" << size.GetHeight();
         return false;
     }
     return true;
@@ -132,18 +152,16 @@ bool AVVideoDecoder::toWxBitmap(wxBitmap &bitmap, wxSize const &size2)
     if (!size1.IsFullySpecified())
         size1 = {frame_->width, frame_->height };
     auto size = size1;
-    if (size.GetWidth() & 0x0f) {
+    if (size.GetWidth() & 0x0f)
         size.SetWidth((size.GetWidth() & ~0x0f) + 0x10);
-        if (size.GetWidth() != width_) {
-            std::fill(bits_.begin(), bits_.end(), 0);
-            width_ = size.GetWidth();
-        }
+    if (size.GetWidth() != width_) {
+        std::fill(bits_.begin(), bits_.end(), 0);
+        width_ = size.GetWidth();
     }
     AVPixelFormat wxFmt = AV_PIX_FMT_RGB32;
     sws_ctx_ = sws_getCachedContext(sws_ctx_,
                                     frame_->width, frame_->height, AVPixelFormat(frame_->format),
-                                    size1.GetWidth(), size1.GetHeight(), wxFmt,
-                                    SWS_GAUSS,
+                                    size1.GetWidth(), size1.GetHeight(), wxFmt, SWS_FAST_BILINEAR,
                                     nullptr, nullptr, nullptr);
     if (sws_ctx_ == nullptr)
         return false;
@@ -154,13 +172,13 @@ bool AVVideoDecoder::toWxBitmap(wxBitmap &bitmap, wxSize const &size2)
     int      strides[] = { size.GetWidth() * 4 };
     int      result_h  = sws_scale(sws_ctx_, frame_->data, frame_->linesize, 0, frame_->height, datas, strides);
     if (result_h != size.GetHeight()) {
-        fprintf(stderr, "AVVideoDecoder: result_h %d %d\n", result_h, size.GetHeight());
+        BOOST_LOG_TRIVIAL(warning) << "result_h " << result_h << " " << size.GetHeight();
         return false;
     }
     bitmap = wxBitmap((char const *) bits_.data(), size.GetWidth(), size.GetHeight(), 32);
     assert(bitmap.IsOk());
     if (!bitmap.IsOk()) {
-        fprintf(stderr, "AVVideoDecoder: bitmap not ok %dx%d\n", size.GetWidth(), size.GetHeight());
+        BOOST_LOG_TRIVIAL(warning) << "bitmap not ok " << size.GetWidth() << "x" << size.GetHeight();
         return false;
     }
     return true;

@@ -3,7 +3,7 @@
 
 # PrusaSlicer specifics:
 # This file is backported from CMake 3.15 distribution to behave uniformly
-# across all versions of CMake. It explicitly adds GLEW_STATIC complile 
+# across all versions of CMake. It explicitly adds GLEW_STATIC compile 
 # definition to static targets which is needed to prevent link errors.
 
 #[=======================================================================[.rst:
@@ -133,6 +133,12 @@ if(GLEW_VERBOSE)
 endif()
 
 if("${CMAKE_GENERATOR_PLATFORM}" MATCHES "x64" OR "${CMAKE_GENERATOR}" MATCHES "Win64")
+  set(_arch "x64")
+elseif("${CMAKE_GENERATOR_PLATFORM}" MATCHES "ARM64|arm64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|aarch64)$")
+  # GLEW's binary distribution ships one 64-bit import-library layout; ARM64
+  # reuses the x64 lib/Release path. (Bambu builds GLEW from source into the
+  # dep prefix, so this only affects the GLEW_ROOT binary-dist fallback.)
+  # Matched case-insensitively since build_win.bat passes -A arm64 (lowercase).
   set(_arch "x64")
 else()
   set(_arch "Win32")

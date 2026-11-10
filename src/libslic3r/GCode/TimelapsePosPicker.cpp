@@ -15,8 +15,13 @@ namespace Slic3r {
         m_nozzle_height_to_rod = print_->config().extruder_clearance_height_to_rod;
         m_nozzle_clearance_radius = print_->config().extruder_clearance_max_radius;
         if (print_->config().nozzle_diameter.size() > 1) {
-            m_extruder_height_gap = std::abs(print_->config().extruder_printable_height.values[0] - print_->config().extruder_printable_height.values[1]);
             m_liftable_extruder_id = print_->config().extruder_printable_height.values[0] < print_->config().extruder_printable_height.values[1] ? 0 : 1;
+            // Only honor the dual-nozzle height gap when more than one extruder is actually used.
+            // Otherwise a dual-nozzle machine printing with a single extruder would needlessly
+            // retreat to the trash bin for every shot below the gap.
+            auto nozzle_group = print_->get_nozzle_group_result();
+            if (nozzle_group && nozzle_group->get_used_extruders().size() > 1)
+                m_extruder_height_gap = std::abs(print_->config().extruder_printable_height.values[0] - print_->config().extruder_printable_height.values[1]);
         }
         m_print_seq = print_->config().print_sequence.value;
         m_based_on_all_layer = print_->config().timelapse_type == TimelapseType::tlSmooth;
@@ -139,7 +144,7 @@ namespace Slic3r {
         for (auto& obj : object_list) {
             for (auto& instance : obj->instances()) {
                 auto instance_bbox = get_real_instance_bbox(instance);
-                bool higher_than_curr_layer = (layer->object() == obj)  ?  false : instance_bbox.max.z() > z_target;
+                bool higher_than_curr_layer = (obj == object_list.back()) ? false : instance_bbox.max.z() > z_target;
                 if(range_intersect(instance_bbox.min.z(), instance_bbox.max.z(), z_low, z_high)){
                     ExPolygon expoly;
                     expoly.contour = {
@@ -300,7 +305,9 @@ namespace Slic3r {
         double interface_raft_height = slice_params.interface_raft_layer_height;
         double contact_raft_layer_height = slice_params.contact_raft_layer_height;
 
-        double ret = print->config().initial_layer_print_height;
+        // A multi-diameter plate printing with a single diameter lays its first layer at that nozzle's height.
+        double ret = print->single_diameter_layering_nozzle() > EPSILON ?
+            slice_params.first_print_layer_height : print->config().initial_layer_print_height.value;
         if (base_raft_layers - 1 > 0)
             ret += (base_raft_layers - 1) * base_raft_height;
         if (interface_raft_layers - 1 > 0)
@@ -361,7 +368,8 @@ namespace Slic3r {
      * @param safe_areas A collection of extended polygons defining the safe areas.
      * @return Point The nearest point within the safe areas or the default timelapse position if no safe areas exist.
      */
-    Point pick_pos_internal(const Point& curr_pos, const ExPolygons& safe_areas, const ExPolygons& path_collision_area, bool detect_path_collision)
+    Point pick_pos_internal(const Point& curr_pos, const ExPolygons& safe_areas, const ExPolygons& path_collision_area, bool detect_path_collision,
+                            const std::optional<Point>& farthest_point = std::nullopt)
     {
         struct CandidatePoint
         {
@@ -380,19 +388,46 @@ namespace Slic3r {
 
         std::priority_queue<CandidatePoint> max_heap;
 
-        double min_distance = std::numeric_limits<double>::max();
-        Point nearest_point = DefaultTimelapsePos;
+        constexpr double candidate_point_segment = scale_(5), weight_of_camera=1./3.;
+        auto penaltyFunc = [&weight_of_camera, &farthest_point](const Point &curr_post, const Point &CameraPos, const Point &candidatet) -> double {
+            if (farthest_point.has_value()) {
+                // Prefer candidate closest to the farthest point (L1 norm)
+                return (farthest_point.value() - candidatet).cwiseAbs().sum();
+            }
+            // move distance + Camera occlusion penalty function
+            double ret_pen = (curr_post - candidatet).cwiseAbs().sum() - weight_of_camera * (CameraPos - candidatet).cwiseAbs().sum();
+            return ret_pen;
+        };
 
         for (const auto& expoly : safe_areas) {
             Polygons polys = to_polygons(expoly);
             for (auto& poly : polys) {
                 for (size_t idx = 0; idx < poly.points.size(); ++idx) {
-                    Line line(poly.points[idx], poly.points[next_idx_modulo(idx, poly.points)]);
-                    Point candidate;
-                    double dist = line.distance_to_squared(curr_pos, &candidate);
-                    max_heap.push({ dist,candidate });
-                    if (max_heap.size() > MAX_CANDIDATE_SIZE)
-                        max_heap.pop();
+                    double             best_penalty   = std::numeric_limits<double>::max();
+                    Point              best_candidate = DefaultTimelapsePos; // the best candidate form current line
+                    //std::vector<Point> candidate_source;
+                    if ((poly.points[idx] - poly.points[next_idx_modulo(idx, poly.points)]).cwiseAbs().sum() < candidate_point_segment) {
+                        best_candidate = poly.points[idx]; // only check the start point if the line is short
+                        best_penalty   = penaltyFunc(curr_pos, DefaultCameraPos, best_candidate);
+                    }else{
+                        Point direct_of_line = poly.points[next_idx_modulo(idx, poly.points)] - poly.points[idx];
+                        double length_L1      = direct_of_line.cwiseAbs().sum();
+                        int    num_steps      = static_cast<int>(length_L1 / candidate_point_segment); // for long line use 5mm segmentation to check
+                        // devide by length_L1 instead of steps, prevent lose accuracy for the step length
+                        direct_of_line.x()    = static_cast<coord_t>(static_cast<double> (direct_of_line.x()) * candidate_point_segment / length_L1);
+                        direct_of_line.y()    = static_cast<coord_t>(static_cast<double> (direct_of_line.y()) * candidate_point_segment / length_L1);
+                        Point candidate;
+                        for (int line_seg_i = 0; line_seg_i <= num_steps; ++line_seg_i) {
+                            candidate=poly.points[idx] + direct_of_line * line_seg_i;
+                            double dist = penaltyFunc(curr_pos, DefaultCameraPos, candidate);
+                            if (dist < best_penalty) {
+                                best_penalty   = dist;
+                                best_candidate = candidate;
+                            }//only push the best point into heap for the whole line
+                        }
+                    }
+                    max_heap.push({best_penalty, best_candidate});
+                    if (max_heap.size() > MAX_CANDIDATE_SIZE) max_heap.pop();
                 }
             }
         }
@@ -475,11 +510,11 @@ namespace Slic3r {
         ExPolygons layer_slices = collect_object_slices_data(ctx.curr_layer, height_gap, object_list, by_object);
         Polygons camera_limit_areas = collect_limit_areas_for_camera(object_list);
         Polygons rod_limit_areas;
-        if (by_object) {
+        if (by_object && ctx.printed_objects && !ctx.printed_objects->empty()) {
             rod_limit_areas = collect_limit_areas_for_rod(object_list, ctx);
         }
         ExPolygons unplacable_area = union_ex(union_ex(layer_slices, camera_limit_areas), rod_limit_areas);
-        ExPolygons extruder_printable_area = m_extruder_printable_area[ctx.picture_extruder_id];
+        ExPolygons extruder_printable_area = m_extruder_printable_area[ctx.curr_extruder_id];
 
         ExPolygons safe_area = diff_ex(extruder_printable_area, unplacable_area);
         safe_area = opening_ex(safe_area, scale_(FILTER_THRESHOLD));
@@ -491,7 +526,7 @@ namespace Slic3r {
             center_p = get_objects_center(object_list);
 
         ExPolygons path_collision_area;
-        if (by_object) {
+        if (by_object && ctx.printed_objects && !ctx.printed_objects->empty()) {
             auto object_without_curr = ctx.printed_objects;
             if (object_without_curr && !object_without_curr->empty())
                 object_without_curr->pop_back();
@@ -500,7 +535,7 @@ namespace Slic3r {
             path_collision_area = union_ex(layer_slices_without_curr, rod_limit_areas);
         }
 
-        return pick_pos_internal(center_p, safe_area,path_collision_area, by_object);
+        return pick_pos_internal(center_p, safe_area, path_collision_area, by_object, ctx.farthest_point);
     }
 
     /**
@@ -539,12 +574,11 @@ namespace Slic3r {
         if (by_object)
             return DefaultTimelapsePos;
 
-        float height_gap = 0;
-        if (ctx.curr_extruder_id != ctx.picture_extruder_id) {
-            if (m_liftable_extruder_id.has_value() && ctx.picture_extruder_id != m_liftable_extruder_id && m_extruder_height_gap.has_value())
-                height_gap = *m_extruder_height_gap;
-        }
-        if (ctx.curr_layer->print_z < height_gap)
+        // In smooth timelapse both nozzles share a single fixed picture position. While the
+        // current layer is still below the dual-nozzle height gap, the idle (lower) nozzle can
+        // collide with printed parts, so always retreat to the trash bin position regardless of
+        // which extruder takes the picture. Traditional (per-layer) mode is handled separately.
+        if (m_extruder_height_gap.has_value() && ctx.curr_layer->print_z <= *m_extruder_height_gap)
             return DefaultTimelapsePos;
         if (m_all_layer_pos)
             return *m_all_layer_pos;
@@ -585,6 +619,50 @@ namespace Slic3r {
 
         m_all_layer_pos = pick_pos_internal(starting_pos, safe_area, {}, by_object);
         return *m_all_layer_pos;
+    }
+
+    bool TimelapsePosPicker::get_is_clear_to_x0(const PosPickCtx &ctx)
+    {
+        bool by_object = m_print_seq == PrintSequence::ByObject;
+        std::vector<const PrintObject *> object_list    = get_object_list(ctx.printed_objects);
+
+        auto range_intersect = [](int left1, int right1, int left2, int right2) {
+            if (left1 <= left2 && left2 <= right1) return true;
+            if (left2 <= left1 && left1 <= right2) return true;
+            return false;
+        };
+
+        ExPolygons   unclear_area;
+        const Layer *layer    = ctx.curr_layer;
+        float        z_target = layer->print_z;
+        float        z_low    = layer->print_z - 0.5;
+        float        z_high   = layer->print_z + 0.5;
+
+        for (auto &obj : object_list) {
+            for (auto &instance : obj->instances()) {
+                auto instance_bbox          = get_real_instance_bbox(instance);
+                bool is_curr_obj = ( obj == object_list.back() ) || ( !by_object ),
+                    higher_than_curr_pos = instance_bbox.max.z() > z_target;
+                if (!is_curr_obj && range_intersect(instance_bbox.min.z(), instance_bbox.max.z(), z_low, z_high)) {
+                    ExPolygon expoly;
+                    expoly.contour = {{scale_(instance_bbox.min.x()), scale_(instance_bbox.min.y())},
+                                      {scale_(instance_bbox.max.x()), scale_(instance_bbox.min.y())},
+                                      {scale_(instance_bbox.max.x()), scale_(instance_bbox.max.y())},
+                                      {scale_(instance_bbox.min.x()), scale_(instance_bbox.max.y())}};
+                    expoly.contour = expand_object_projection(expoly.contour, by_object, higher_than_curr_pos);
+                    unclear_area.emplace_back(std::move(expoly));
+                }
+            }
+        }
+
+        Point curr_pos_in_plate = {ctx.curr_pos.x() - scale_(m_plate_offset.x()), ctx.curr_pos.y() - scale_(m_plate_offset.y())};
+        for (const ExPolygon &expoly : unclear_area) {
+            BoundingBox bbox = expoly.contour.bounding_box();
+            if (curr_pos_in_plate.y() < bbox.min.y() || curr_pos_in_plate.y() > bbox.max.y()) continue;
+            if (bbox.min.x() <= curr_pos_in_plate.x()) return false;
+        }
+
+        return true;
     }
 
 }

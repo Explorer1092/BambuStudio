@@ -2,8 +2,10 @@
 #include "GLGizmoFlatten.hpp"
 #include "slic3r/GUI/GLCanvas3D.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
+#include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmosCommon.hpp"
 
+#include "libslic3r/Geometry.hpp"
 #include "libslic3r/Geometry/ConvexHull.hpp"
 #include "libslic3r/Model.hpp"
 
@@ -151,7 +153,7 @@ bool GLGizmoFlatten::update_raycast_cache(const Vec2d &mouse_position, const Cam
                 if (m_faltten_type == FlattenType::Triangle) {
                     auto mo                   = m_c->selection_info()->model_object();
                     auto mv                   = mo->volumes[mesh_id];
-                    m_hit_object_normal       = mv->get_matrix().cast<float>() * closest_nromal;
+                    m_hit_object_normal       = Geometry::transform_normal(mv->get_matrix(), closest_nromal).cast<float>();
                 }
             }
         }
@@ -372,7 +374,7 @@ void GLGizmoFlatten::update_planes()
     t.set_scaling_factor(Vec3d(1./scaling(0), 1./scaling(1), 1./scaling(2)));
 
     // Now we'll go through all the polygons, transform the points into xy plane to process them:
-    for (unsigned int polygon_id=0; polygon_id < m_planes.size(); ++polygon_id) {
+    for (int polygon_id=0; polygon_id < m_planes.size(); ++polygon_id) {
         Pointf3s& polygon = m_planes[polygon_id].vertices;
         const Vec3d& normal = m_planes[polygon_id].normal;
 
@@ -422,8 +424,9 @@ void GLGizmoFlatten::update_planes()
         }
 
         if (discard) {
-            m_planes[polygon_id--] = std::move(m_planes.back());
+            m_planes[polygon_id] = std::move(m_planes.back());
             m_planes.pop_back();
+            polygon_id--;
             continue;
         }
 

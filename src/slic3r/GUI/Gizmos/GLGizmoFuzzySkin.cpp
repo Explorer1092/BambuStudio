@@ -17,8 +17,7 @@
 
 
 #include <GL/glew.h>
-
-#include <boost/log/trivial.hpp>
+#include "libslic3r/Log.hpp"
 
 namespace Slic3r::GUI {
 
@@ -40,13 +39,13 @@ void GLGizmoFuzzySkin::on_shutdown()
     if (m_thread.joinable()) {
         Print *print = m_print_instance.print_object->print();
         if (print) {
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "cancel the print";
+            BOOST_LOG_TRIVIAL(info) << "cancel the print";
             print->cancel();
         }
         //join the thread
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "try to join thread for 2000 ms";
+        BOOST_LOG_TRIVIAL(info) << "try to join thread for 2000 ms";
         auto ret = m_thread.try_join_for(boost::chrono::milliseconds(2000));
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "join thread returns "<<ret;
+        BOOST_LOG_TRIVIAL(info) << "join thread returns "<<ret;
     }
 
     m_print_instance.print_object = NULL;
@@ -163,7 +162,8 @@ void GLGizmoFuzzySkin::render_triangles(const Selection& selection) const
 
         Transform3d trafo_matrix;
         if (m_parent.get_canvas_type() == GLCanvas3D::CanvasAssembleView) {
-            trafo_matrix = mo->instances[selection.get_instance_idx()]->get_assemble_transformation().get_matrix() * mv->get_matrix();
+            // BBS: assembly view world matrix = instance_assemble * volume_assemble.
+            trafo_matrix = mo->instances[selection.get_instance_idx()]->get_assemble_transformation().get_matrix() * mv->get_assemble_transformation().get_matrix();
             trafo_matrix.translate(mv->get_transformation().get_offset() * (GLVolume::explosion_ratio - 1.0) +
                                    mo->instances[selection.get_instance_idx()]->get_offset_to_assembly() * (GLVolume::explosion_ratio - 1.0));
         } else {

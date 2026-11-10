@@ -15,6 +15,10 @@
 
 #include <string>
 #include <map>
+#include <atomic>
+#include <memory>
+#include <mutex>
+#include <vector>
 
 #include "GUI_Utils.hpp"
 #include "Event.hpp"
@@ -27,8 +31,6 @@
 #include "UnsavedChangesDialog.hpp"
 #include "Widgets/SideButton.hpp"
 #include "Widgets/SideMenuPopup.hpp"
-#include "FilamentGroupPopup.hpp"
-
 
 // BBS
 #include "BBLTopbar.hpp"
@@ -52,6 +54,8 @@ class PrintHostQueueDialog;
 class Plater;
 class MainFrame;
 class ParamsDialog;
+class FilamentGroupPopup;
+class DeviceWebPage;
 
 enum QuickSlice
 {
@@ -96,6 +100,7 @@ class MainFrame : public DPIFrame
 #endif
     bool     m_loaded {false};
     wxTimer* m_reset_title_text_colour_timer{ nullptr };
+    wxString m_title_cache;  // last value applied by update_title(), avoids redundant SetTitle
 
     wxString    m_qs_last_input_file = wxEmptyString;
     wxString    m_qs_last_output_file = wxEmptyString;
@@ -134,6 +139,8 @@ class MainFrame : public DPIFrame
     //bool can_eject() const;
     bool can_slice() const;
     bool can_change_view() const;
+    bool can_toggle_camera_fullscreen() const;
+    void toggle_camera_fullscreen();
     bool can_select() const;
     bool can_deselect() const;
     bool can_clone() const;
@@ -158,19 +165,43 @@ class MainFrame : public DPIFrame
 
     struct FileHistory : wxFileHistory
     {
-        FileHistory(int max) : wxFileHistory(max) {}
+        FileHistory(int max) : wxFileHistory(max), m_state(std::make_shared<AsyncState>()) {}
+        ~FileHistory() { m_state->cancel(); }
+
         std::wstring GetThumbnailUrl(int index) const;
 
         virtual void AddFileToHistory(const wxString &file);
         virtual void RemoveFileFromHistory(size_t i);
         size_t FindFileInHistory(const wxString &file);
 
-        void LoadThumbnails();
+        // Reading the thumbnails means opening every recent 3mf, which is too slow to do while
+        // the menu bar is being built. Scan on a worker thread and merge back on the main thread.
+        void LoadThumbnailsAsync();
 
         void SetMaxFiles(int max);
     private:
+        // Main thread only: merge a worker's result back, matching by path rather than by index.
+        void ApplyThumbnails(const std::vector<wxString> &files, const std::vector<std::string> &data);
+
+        // Shared with the thumbnail worker, and outliving this object. The worker takes the lock
+        // only to check the flag and post its result back, never while reading files, so cancelling
+        // waits for at most one CallAfter. That handshake is what keeps the worker from calling
+        // wxGetApp() after wxEntryCleanup() has dropped the app instance.
+        struct AsyncState
+        {
+            std::mutex       mutex;
+            std::atomic_bool cancelled{false};
+
+            void cancel()
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                cancelled = true;
+            }
+        };
+
         std::deque<std::string> m_thumbnails;
         bool m_load_called = false;
+        std::shared_ptr<AsyncState> m_state;
     };
 
     FileHistory m_recent_projects;
@@ -210,6 +241,7 @@ public:
 #ifdef __APPLE__
     bool get_mac_full_screen() { return m_mac_fullscreen; }
 #endif
+    DeviceWebPage* web_device() const { return m_web_device; }
     //BBS GUI refactor
     enum TabPosition
     {
@@ -219,9 +251,11 @@ public:
         tpMonitor       = 3,
         tpMultiDevice   = 4,
         tpProject       = 5,
-        tpCalibration   = 6,
-        tpAuxiliary     = 7,
-        toDebugTool     = 8,
+        tpCalibration      = 6,
+        tpAuxiliary        = 7,
+        toDebugTool        = 8,
+        tpFilamentManager  = 9,
+        tpWebDevice        = 10,
     };
 
     //BBS: add slice&&print status update logic
@@ -329,6 +363,7 @@ public:
     void        request_select_tab(TabPosition pos);
     int         get_calibration_curr_tab();
     void        select_view(const std::string& direction);
+    void        view_zoom_to_fit() const;
     // Propagate changed configuration from the Tab to the Plater and save changes to the AppConfig
     void        on_config_changed(DynamicPrintConfig* cfg) const ;
     void        set_print_button_to_default(PrintSelectType select_type);
@@ -339,6 +374,12 @@ public:
     bool can_upload() const;
     void save_project();
     bool save_project_as(const wxString& filename = wxString());
+
+    // Gate for leaving the project page while it is being edited. Returns true when
+    // the caller may proceed. Returns false when the caller must abort (veto) either
+    // because the user cancelled, or because the answer is still pending - in the
+    // latter case `retry` is invoked once the page reports back.
+    bool confirm_project_page_can_leave(std::function<void()> retry);
 
     void        add_to_recent_projects(const wxString& filename);
     void        get_recent_projects(boost::property_tree::wptree &tree, int images);
@@ -376,8 +417,15 @@ public:
     //AuxiliaryPanel*       m_auxiliary{ nullptr };
     MultiMachinePage*     m_multi_machine{ nullptr };
     ProjectPanel*         m_project{ nullptr };
+    // State for confirm_project_page_can_leave(): the page answers the
+    // unsaved-changes query asynchronously, so the verdict is cached for the
+    // replayed attempt and the query timestamp guards against a mute page.
+    bool                  m_project_leave_checked{ false };
+    bool                  m_project_leave_dirty{ false };
+    long long             m_project_leave_query_ms{ 0 };
 
     CalibrationPanel*     m_calibration{ nullptr };
+    DeviceWebPage*        m_web_device{ nullptr };
     WebViewPanel*         m_webview { nullptr };
     PrinterWebView*       m_printer_view{nullptr};
     wxLogWindow*          m_log_window { nullptr };
@@ -401,6 +449,12 @@ public:
     SideButton* m_print_btn{ nullptr };
     SideButton* m_print_option_btn{ nullptr };
 
+    wxWindowID expand_program_id = wxNewId();
+    wxWindowID expand_helio_id = wxNewId();
+
+    wxStaticBitmap* split_line_icon{nullptr};
+    ExpandButtonHolder* expand_program_holder{nullptr};
+
     SidePopup*  m_slice_option_pop_up{ nullptr };
 
     FilamentGroupPopup* m_filament_group_popup{ nullptr };
@@ -411,17 +465,23 @@ public:
     //BBS
     void update_side_button_style();
     void update_slice_print_status(SlicePrintEventType event, bool can_slice = true, bool can_print = true);
+    void update_helio_button_state();
+
 
     int select_device_page_count{ 0 };
 
 #ifdef __APPLE__
     std::unique_ptr<wxTaskBarIcon> m_taskbar_icon;
+    bool        m_sync_dialog_pending_activate { false };
+    void        on_activate_app_show_sync_dialog(wxActivateEvent& evt);
 #endif // __APPLE__
 
 #ifdef _WIN32
     void*				m_hDeviceNotify { nullptr };
     uint32_t  			m_ulSHChangeNotifyRegister { 0 };
 	static constexpr int WM_USER_MEDIACHANGED { 0x7FFF }; // WM_USER from 0x0400 to 0x7FFF, picking the last one to not interfere with wxWidgets allocation
+    bool                m_is_in_move_or_resize { false };
+    ULONGLONG           m_last_resize_layout_ms { 0 };
 #endif // _WIN32
 };
 
@@ -431,7 +491,6 @@ wxDECLARE_EVENT(EVT_USER_LOGIN_HANDLE, wxCommandEvent);
 wxDECLARE_EVENT(EVT_CHECK_PRIVACY_VER, wxCommandEvent);
 wxDECLARE_EVENT(EVT_CHECK_PRIVACY_SHOW, wxCommandEvent);
 wxDECLARE_EVENT(EVT_SHOW_IP_DIALOG, wxCommandEvent);
-wxDECLARE_EVENT(EVT_SET_SELECTED_MACHINE, wxCommandEvent);
 wxDECLARE_EVENT(EVT_UPDATE_MACHINE_LIST, wxCommandEvent);
 wxDECLARE_EVENT(EVT_UPDATE_PRESET_CB, SimpleEvent);
 

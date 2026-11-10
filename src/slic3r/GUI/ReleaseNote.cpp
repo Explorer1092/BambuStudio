@@ -1,21 +1,28 @@
 #include "ReleaseNote.hpp"
 #include "I18N.hpp"
+#include "GCodeViewer.hpp"
 
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Thread.hpp"
 #include "GUI.hpp"
 #include "GUI_App.hpp"
+#include "DeviceCore/DevHMSQuery.h"
 #include "GUI_Preview.hpp"
 #include "MainFrame.hpp"
 #include "format.hpp"
+#include "HelioReleaseNote.hpp"
 #include "Widgets/ProgressDialog.hpp"
 #include "Widgets/RoundedRectangle.hpp"
 #include "Widgets/StaticBox.hpp"
 #include "Widgets/WebView.hpp"
+#include "Widgets/LinkLabel.hpp"
+#include "Widgets/SwitchButton.hpp"
 
 #include <wx/regex.h>
 #include <wx/progdlg.h>
 #include <wx/clipbrd.h>
+#include <wx/dcbuffer.h>
+#include <wx/dcclient.h>
 #include <wx/dcgraph.h>
 #include <miniz.h>
 #include <wx/valnum.h>
@@ -25,8 +32,169 @@
 
 #include "DeviceCore/DevManager.h"
 #include "DeviceCore/DevStorage.h"
+#include "libslic3r/Log.hpp"
 
 namespace Slic3r { namespace GUI {
+
+// Helio dark palette constants (for ExpandCenterDialog - Welcome to Helio Additive)
+namespace {
+    const wxColour HELIO_BG_BASE(7, 9, 12);       // #07090C
+    const wxColour HELIO_CARD_BG(14, 19, 32);     // #0E1320
+    const wxColour HELIO_BORDER(255, 255, 255, 25); // rgba(255,255,255,0.10)
+    const wxColour HELIO_TEXT(238, 242, 255);     // #EEF2FF
+    const wxColour HELIO_MUTED(168, 176, 192);    // #A8B0C0
+}
+
+class DialogWikiWarningLabel : public wxPanel
+{
+public:
+    DialogWikiWarningLabel(
+        wxWindow* parent,
+        const wxString& prefix,
+        const wxString& link,
+        const wxString& suffix,
+        const wxString& url,
+        const wxColour& text_colour,
+        const wxColour& link_colour,
+        int width)
+        : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(width, 1), wxBORDER_NONE)
+        , m_prefix(prefix)
+        , m_link(link)
+        , m_suffix(suffix)
+        , m_url(url)
+        , m_text_colour(text_colour)
+        , m_link_colour(link_colour)
+        , m_width(width)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetBackgroundColour(parent->GetBackgroundColour());
+        SetCursor(wxCURSOR_ARROW);
+        layout_text();
+
+        Bind(wxEVT_PAINT, &DialogWikiWarningLabel::on_paint, this);
+        Bind(wxEVT_MOTION, &DialogWikiWarningLabel::on_motion, this);
+        Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) {
+            m_link_hovered = false;
+            SetCursor(wxCURSOR_ARROW);
+        });
+        Bind(wxEVT_LEFT_UP, [this](wxMouseEvent& event) {
+            if (hit_link(event.GetPosition()))
+                wxLaunchDefaultBrowser(m_url);
+        });
+    }
+
+private:
+    struct TextRun {
+        wxString text;
+        wxPoint position;
+        wxSize size;
+        bool is_link;
+    };
+
+    void layout_text()
+    {
+        wxClientDC dc(this);
+        dc.SetFont(Label::Body_14);
+        const int line_height = dc.GetCharHeight();
+        int x = 0;
+        int y = 0;
+
+        auto place_token = [&](const wxString& token, bool is_link) {
+            if (token.empty()) return;
+            dc.SetFont(is_link ? Label::Body_14.Underlined() : Label::Body_14);
+            const wxSize size = dc.GetTextExtent(token);
+            const bool is_space = token == " " || token == "\t";
+            if (!is_space && x > 0 && x + size.x > m_width) {
+                x = 0;
+                y += line_height;
+            }
+            if (is_space && x == 0) return;
+            m_runs.push_back({token, wxPoint(x, y), wxSize(size.x, line_height), is_link});
+            if (is_link)
+                m_link_rects.emplace_back(x, y, size.x, line_height);
+            x += size.x;
+        };
+
+        auto append_text = [&](const wxString& text, bool is_link) {
+            wxString token;
+            auto flush_token = [&]() {
+                if (!token.empty()) {
+                    place_token(token, is_link);
+                    token.clear();
+                }
+            };
+
+            for (const wxUniChar ch : text) {
+                if (ch == '\n') {
+                    flush_token();
+                    x = 0;
+                    y += line_height;
+                } else if (ch == ' ' || ch == '\t') {
+                    flush_token();
+                    wxString whitespace;
+                    whitespace += ch;
+                    place_token(whitespace, is_link);
+                } else if (ch.GetValue() >= 0x2E80) {
+                    flush_token();
+                    wxString character;
+                    character += ch;
+                    place_token(character, is_link);
+                } else {
+                    token += ch;
+                }
+            }
+            flush_token();
+        };
+
+        append_text(m_prefix, false);
+        append_text(m_link, true);
+        append_text(m_suffix, false);
+
+        const int height = std::max(line_height, y + line_height);
+        SetMinSize(wxSize(m_width, height));
+        SetMaxSize(wxSize(m_width, height));
+    }
+
+    void on_paint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC dc(this);
+        dc.SetBackground(wxBrush(GetBackgroundColour()));
+        dc.Clear();
+        for (const auto& run : m_runs) {
+            dc.SetFont(run.is_link ? Label::Body_14.Underlined() : Label::Body_14);
+            dc.SetTextForeground(run.is_link ? m_link_colour : m_text_colour);
+            dc.DrawText(run.text, run.position);
+        }
+    }
+
+    void on_motion(wxMouseEvent& event)
+    {
+        const bool is_link = hit_link(event.GetPosition());
+        if (is_link != m_link_hovered) {
+            m_link_hovered = is_link;
+            SetCursor(is_link ? wxCursor(wxCURSOR_HAND) : wxCursor(wxCURSOR_ARROW));
+        }
+    }
+
+    bool hit_link(const wxPoint& point) const
+    {
+        return std::any_of(m_link_rects.begin(), m_link_rects.end(), [&point](const wxRect& rect) {
+            return rect.Contains(point);
+        });
+    }
+
+private:
+    wxString m_prefix;
+    wxString m_link;
+    wxString m_suffix;
+    wxString m_url;
+    wxColour m_text_colour;
+    wxColour m_link_colour;
+    int m_width;
+    bool m_link_hovered{false};
+    std::vector<TextRun> m_runs;
+    std::vector<wxRect> m_link_rects;
+};
 
 wxDEFINE_EVENT(EVT_SECONDARY_CHECK_CONFIRM, wxCommandEvent);
 wxDEFINE_EVENT(EVT_SECONDARY_CHECK_CANCEL, wxCommandEvent);
@@ -36,11 +204,30 @@ wxDEFINE_EVENT(EVT_CHECKBOX_CHANGE, wxCommandEvent);
 wxDEFINE_EVENT(EVT_ENTER_IP_ADDRESS, wxCommandEvent);
 wxDEFINE_EVENT(EVT_CLOSE_IPADDRESS_DLG, wxCommandEvent);
 wxDEFINE_EVENT(EVT_CHECK_IP_ADDRESS_FAILED, wxCommandEvent);
-wxDEFINE_EVENT(EVT_CHECK_IP_ADDRESS_LAYOUT, wxCommandEvent);
 wxDEFINE_EVENT(EVT_SECONDARY_CHECK_RETRY, wxCommandEvent);
 wxDEFINE_EVENT(EVT_UPDATE_NOZZLE, wxCommandEvent);
-wxDEFINE_EVENT(EVT_UPDATE_TEXT_MSG, wxCommandEvent);
 wxDEFINE_EVENT(EVT_ERROR_DIALOG_BTN_CLICKED, wxCommandEvent);
+
+static std::string url_encode(const std::string& value) {
+	std::ostringstream escaped;
+	escaped.fill('0');
+	escaped << std::hex;
+	for (std::string::const_iterator i = value.begin(), n = value.end(); i != n; ++i) {
+		std::string::value_type c = (*i);
+
+		// Keep alphanumeric and other accepted characters intact
+		if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+			escaped << c;
+			continue;
+		}
+
+		// Any other characters are percent-encoded
+		escaped << std::uppercase;
+		escaped << '%' << std::setw(2) << int((unsigned char)c);
+		escaped << std::nouppercase;
+	}
+	return escaped.str();
+}
 
 ReleaseNoteDialog::ReleaseNoteDialog(Plater *plater /*= nullptr*/)
     : DPIDialog(static_cast<wxWindow *>(wxGetApp().mainframe), wxID_ANY, _L("Release Note"), wxDefaultPosition, wxDefaultSize, wxCAPTION | wxCLOSE_BOX)
@@ -74,10 +261,33 @@ ReleaseNoteDialog::ReleaseNoteDialog(Plater *plater /*= nullptr*/)
 
     m_sizer_right->Add(0, 0, 1, wxTOP, FromDIP(15));
 
-    m_vebview_release_note = new wxScrolledWindow(this, wxID_ANY, wxDefaultPosition, wxSize(FromDIP(560), FromDIP(430)), wxVSCROLL);
-    m_vebview_release_note->SetScrollRate(5, 5);
-    m_vebview_release_note->SetBackgroundColour(wxColour(0xF8, 0xF8, 0xF8));
+    // firmware release notes from cloud are markdown, render them in webview like UpdateVersionDialog
+    m_vebview_release_note = WebView::CreateWebView(this, "");
+    m_vebview_release_note->SetBackgroundColour(wxGetApp().dark_mode() ? wxColour(0x36, 0x36, 0x3C) : wxColour(0xF8, 0xF8, 0xF8));
+    m_vebview_release_note->SetSize(wxSize(FromDIP(560), FromDIP(430)));
+    m_vebview_release_note->SetMinSize(wxSize(FromDIP(560), FromDIP(430)));
     m_vebview_release_note->SetMaxSize(wxSize(FromDIP(560), FromDIP(430)));
+
+#ifndef __WINDOWS__
+    m_vebview_release_note->Bind(wxEVT_WEBVIEW_LOADED, [this](auto &e) {
+#else
+    m_vebview_release_note->Bind(wxEVT_WEBVIEW_NAVIGATED, [this](auto &e) {
+#endif
+        m_page_loaded = true;
+        show_release_note();
+        e.Skip();
+    });
+
+    fs::path ph(data_dir());
+    ph /= "resources/tooltip/releasenote.html";
+    if (!fs::exists(ph)) {
+        ph = resources_dir();
+        ph /= "tooltip/releasenote.html";
+    }
+    auto url = ph.string();
+    std::replace(url.begin(), url.end(), '\\', '/');
+    url = "file:///" + url;
+    m_vebview_release_note->LoadURL(from_u8(url));
 
     m_sizer_right->Add(m_vebview_release_note, 0, wxEXPAND | wxRIGHT, FromDIP(20));
     m_sizer_body->Add(m_sizer_right, 1, wxBOTTOM | wxEXPAND, FromDIP(30));
@@ -101,15 +311,25 @@ void ReleaseNoteDialog::on_dpi_changed(const wxRect &suggested_rect)
 void ReleaseNoteDialog::update_release_note(wxString release_note, std::string version)
 {
     m_text_up_info->SetLabel(wxString::Format(_L("version %s update information :"), version));
-    wxBoxSizer * sizer_text_release_note = new wxBoxSizer(wxVERTICAL);
-    auto        m_staticText_release_note = new ::Label(m_vebview_release_note, release_note, LB_AUTO_WRAP);
-    m_staticText_release_note->SetMinSize(wxSize(FromDIP(530), -1));
-    m_staticText_release_note->SetMaxSize(wxSize(FromDIP(530), -1));
-    sizer_text_release_note->Add(m_staticText_release_note, 0, wxALL, 5);
-    m_vebview_release_note->SetSizer(sizer_text_release_note);
-    m_vebview_release_note->Layout();
-    m_vebview_release_note->Fit();
+    m_mkdown_text = release_note.ToUTF8().data();
+    // page may not be loaded yet, the loaded handler will render it then
+    show_release_note();
     wxGetApp().UpdateDlgDarkUI(this);
+}
+
+void ReleaseNoteDialog::show_release_note()
+{
+    if (!m_page_loaded || m_mkdown_text.empty()) return;
+
+    WebView::RunScript(m_vebview_release_note, "window.showMarkdown('" + url_encode(m_mkdown_text) + "', true);");
+    // tooltip/main.css defaults body text to white, set colors explicitly to follow app theme.
+    // It also sets html font-size to 10px and body font to -apple-system-body, which Chromium ignores,
+    // so body text falls back to 10px; set it explicitly.
+    bool is_dark = wxGetApp().dark_mode();
+    std::string theme_script = std::string("document.body.style.backgroundColor='") + (is_dark ? "#36363C" : "#F8F8F8") + "';"
+                             + "document.body.style.color='" + (is_dark ? "#FFFFFF" : "#000000") + "';"
+                             + "document.body.style.fontSize='14px';";
+    WebView::RunScript(m_vebview_release_note, theme_script);
 }
 
 UpdatePluginDialog::UpdatePluginDialog(wxWindow* parent /*= nullptr*/)
@@ -230,6 +450,7 @@ void UpdatePluginDialog::update_info(std::string json_path)
         description_str = j["description"];
     }
     catch (nlohmann::detail::parse_error& err) {
+        BOOST_LOG_TRIVIAL(warning) << current_exception_message();
         //BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": parse " << json_path << " got a nlohmann::detail::parse_error, reason = " << err.what();
         return;
     }
@@ -410,6 +631,15 @@ wxWebView* UpdateVersionDialog::CreateTipView(wxWindow* parent)
 
 void UpdateVersionDialog::OnLoaded(wxWebViewEvent& event)
 {
+    // GitHub prefixes user-written ids with "user-content-" but keeps the hrefs as-is,
+    // so in-page anchors in release notes (e.g. "English | 中文") never resolve.
+    WebView::RunScript(m_vebview_release_note,
+        "if(!window.__bblAnchorFix){window.__bblAnchorFix=1;document.addEventListener('click',function(e){"
+        "var a=e.target.closest&&e.target.closest('a[href^=\"#\"]');if(!a)return;"
+        "var id=decodeURIComponent(a.getAttribute('href').slice(1));"
+        "if(!id||document.getElementById(id))return;"
+        "var t=document.getElementById('user-content-'+id);"
+        "if(t){e.preventDefault();t.scrollIntoView();}},true);}");
     event.Skip();
 }
 
@@ -421,27 +651,6 @@ void UpdateVersionDialog::OnTitleChanged(wxWebViewEvent& event)
 void UpdateVersionDialog::OnError(wxWebViewEvent& event)
 {
     event.Skip();
-}
-
-static std::string url_encode(const std::string& value) {
-	std::ostringstream escaped;
-	escaped.fill('0');
-	escaped << std::hex;
-	for (std::string::const_iterator i = value.begin(), n = value.end(); i != n; ++i) {
-		std::string::value_type c = (*i);
-
-		// Keep alphanumeric and other accepted characters intact
-		if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-			escaped << c;
-			continue;
-		}
-
-		// Any other characters are percent-encoded
-		escaped << std::uppercase;
-		escaped << '%' << std::setw(2) << int((unsigned char)c);
-		escaped << std::nouppercase;
-	}
-	return escaped.str();
 }
 
 bool UpdateVersionDialog::ShowReleaseNote(std::string content)
@@ -981,7 +1190,7 @@ void PrintErrorDialog::update_text_image(const wxString& text, const wxString& e
     m_vebview_release_note->SetSizer(sizer_text_release_note);
 
     if (!image_url.empty()) {
-        const wxImage& img = wxGetApp().get_hms_query()->query_image_from_local(image_url);
+        const wxImage& img = wxGetApp().get_hms_query_mgr()->query_image_from_local(image_url);
         if (!img.IsOk() && image_url.Contains("http"))
         {
             web_request = wxWebSession::GetDefault().CreateRequest(this, image_url);
@@ -1183,7 +1392,7 @@ ConfirmBeforeSendDialog::ConfirmBeforeSendDialog(wxWindow* parent, wxWindowID id
     m_sizer_right->Add(m_vebview_release_note, 0, wxEXPAND | wxRIGHT | wxLEFT, FromDIP(15));
 
 
-    auto bottom_sizer = new wxBoxSizer(wxVERTICAL);
+    auto bottom_sizer = new wxBoxSizer(wxHORIZONTAL);
     auto sizer_button = new wxBoxSizer(wxHORIZONTAL);
     StateColor btn_bg_green(std::pair<wxColour, int>(wxColour(27, 136, 68), StateColor::Pressed), std::pair<wxColour, int>(wxColour(61, 203, 115), StateColor::Hovered),
         std::pair<wxColour, int>(AMS_CONTROL_BRAND_COLOUR, StateColor::Normal));
@@ -1196,12 +1405,10 @@ ConfirmBeforeSendDialog::ConfirmBeforeSendDialog(wxWindow* parent, wxWindowID id
         auto checkbox_sizer = new wxBoxSizer(wxHORIZONTAL);
         m_show_again_checkbox = new wxCheckBox(this, wxID_ANY, _L("Don't show again"), wxDefaultPosition, wxDefaultSize, 0);
         m_show_again_checkbox->Bind(wxEVT_COMMAND_CHECKBOX_CLICKED, [this](wxCommandEvent& e) {
-            not_show_again = !not_show_again;
-            m_show_again_checkbox->SetValue(not_show_again);
+            not_show_again = e.IsChecked();
         });
-        checkbox_sizer->Add(FromDIP(15), 0, 0, 0);
-        checkbox_sizer->Add(m_show_again_checkbox, 0, wxALL, FromDIP(5));
-        bottom_sizer->Add(checkbox_sizer, 0, wxBOTTOM | wxEXPAND, 0);
+        checkbox_sizer->Add(m_show_again_checkbox, 0, wxALIGN_CENTER_VERTICAL);
+        bottom_sizer->Add(checkbox_sizer, 0, wxLEFT | wxALIGN_CENTER_VERTICAL, FromDIP(15));
     }
     m_button_ok = new Button(this, _L("Confirm"));
     m_button_ok->SetBackgroundColor(btn_bg_green);
@@ -1256,12 +1463,12 @@ ConfirmBeforeSendDialog::ConfirmBeforeSendDialog(wxWindow* parent, wxWindowID id
 
     m_button_update_nozzle->Hide();
 
-    sizer_button->AddStretchSpacer();
     sizer_button->Add(m_button_ok, 0, wxALL, FromDIP(5));
     sizer_button->Add(m_button_update_nozzle, 0, wxALL, FromDIP(5));
     sizer_button->Add(m_button_cancel, 0, wxALL, FromDIP(5));
     sizer_button->Add(FromDIP(5),0, 0, 0);
-    bottom_sizer->Add(sizer_button, 0, wxEXPAND | wxRIGHT | wxLEFT, 0);
+    bottom_sizer->AddStretchSpacer();
+    bottom_sizer->Add(sizer_button, 0, wxALIGN_CENTER_VERTICAL);
 
 
     m_sizer_right->Add(bottom_sizer, 0, wxEXPAND | wxRIGHT | wxLEFT, FromDIP(20));
@@ -1317,38 +1524,45 @@ void ConfirmBeforeSendDialog::update_text(std::vector<ConfirmBeforeSendInfo> tex
 
 
     auto height = 0;
-    for (auto text : texts) {
+    for (const auto& text : texts) {
+        wxWindow* text_item = nullptr;
+        int item_height = 0;
+        if (text.wiki_url.empty()) {
+            auto label_item = new Label(m_vebview_release_note, text.text, LB_AUTO_WRAP);
+            if (enable_warning_clr && text.level == ConfirmBeforeSendInfo::InfoLevel::Warning)
+                label_item->SetForegroundColour(wxColour(0xFF, 0x6F, 0x00));
 
-        Label* label_item = nullptr;
-        if (text.wiki_url.empty())
-        {
-            label_item = new Label(m_vebview_release_note, text.text, LB_AUTO_WRAP);
+            label_item->SetMaxSize(wxSize(FromDIP(494), -1));
+            label_item->SetMinSize(wxSize(FromDIP(494), -1));
+            label_item->Wrap(FromDIP(494));
+            label_item->Layout();
+            text_item = label_item;
+            item_height = label_item->GetSize().y;
+        } else {
+            const wxColour text_colour =
+                enable_warning_clr && text.level == ConfirmBeforeSendInfo::InfoLevel::Warning
+                    ? wxColour(0xFF, 0x6F, 0x00)
+                    : wxColour(0x26, 0x2E, 0x30);
+            auto wiki_label = new DialogWikiWarningLabel(
+                m_vebview_release_note,
+                text.text + _L(" Please "),
+                _L("refer to the Wiki User Guide"),
+                _L(" before continuing."),
+                text.wiki_url,
+                text_colour,
+                AMS_CONTROL_BRAND_COLOUR,
+                FromDIP(494));
+            text_item = wiki_label;
+            item_height = wiki_label->GetMinSize().y;
         }
-        else
-        {
-            label_item = new Label(m_vebview_release_note, text.text + " " + _L("Please refer to Wiki before use->"), LB_AUTO_WRAP);
-            label_item->Bind(wxEVT_LEFT_DOWN, [this, text](wxMouseEvent& e) { wxLaunchDefaultBrowser(text.wiki_url);});
-            label_item->Bind(wxEVT_ENTER_WINDOW, [this](auto& e) { SetCursor(wxCURSOR_HAND); });
-            label_item->Bind(wxEVT_LEAVE_WINDOW, [this](auto& e) { SetCursor(wxCURSOR_ARROW); });
-        }
 
-        if (enable_warning_clr && text.level == ConfirmBeforeSendInfo::InfoLevel::Warning)
-        {
-            label_item->SetForegroundColour(wxColour(0xFF, 0x6F, 0x00));
-        }
-
-        label_item->SetMaxSize(wxSize(FromDIP(494), -1));
-        label_item->SetMinSize(wxSize(FromDIP(494), -1));
-        label_item->Wrap(FromDIP(494));
-        label_item->Layout();
-
-        sizer_text_release_note->Add(label_item, 0, wxALIGN_CENTER | wxALL, FromDIP(3));
-        height += label_item->GetSize().y;
+        sizer_text_release_note->Add(text_item, 0, wxALIGN_CENTER | wxALL, FromDIP(3));
+        height += item_height;
     }
 
     m_vebview_release_note->Layout();
     if (height < FromDIP(500))
-        m_vebview_release_note->SetMinSize(wxSize(-1, height + FromDIP(25)));
+        m_vebview_release_note->SetMinSize(wxSize(-1, height + FromDIP(35)));
     else {
         m_vebview_release_note->SetMinSize(wxSize(-1, FromDIP(500)));
     }
@@ -1372,7 +1586,7 @@ void ConfirmBeforeSendDialog::on_show()
 void ConfirmBeforeSendDialog::on_hide()
 {
     if (m_show_again_checkbox != nullptr && not_show_again && show_again_config_text != "")
-        wxGetApp().app_config->set(show_again_config_text, "1");
+        wxGetApp().app_config->set(show_again_config_text, show_again_config_value);
     EndModal(wxID_OK);
 }
 
@@ -1421,6 +1635,24 @@ void ConfirmBeforeSendDialog::show_update_nozzle_button(bool show)
 void ConfirmBeforeSendDialog::hide_button_ok()
 {
     m_button_ok->Hide();
+}
+
+void ConfirmBeforeSendDialog::edit_ok_button_txt(const wxString& txt, bool switch_white)
+{
+    m_button_ok->SetLabel(txt);
+
+    if (switch_white)
+    {
+        StateColor btn_bg_white(std::pair<wxColour, int>(wxColour(206, 206, 206), StateColor::Pressed),
+                                std::pair<wxColour, int>(wxColour(238, 238, 238), StateColor::Hovered),
+                                std::pair<wxColour, int>(*wxWHITE, StateColor::Normal));
+        StateColor btn_text_white(std::pair<wxColour, int>(*wxLIGHT_GREY, StateColor::Disabled),
+                                  std::pair<wxColour, int>(*wxBLACK, StateColor::Normal));
+        m_button_ok->SetBackgroundColor(btn_bg_white);
+        m_button_ok->SetBorderColor(wxColour(38, 46, 48));
+        m_button_ok->SetTextColor(btn_text_white);
+    }
+    rescale();
 }
 
 void ConfirmBeforeSendDialog::edit_cancel_button_txt(const wxString& txt, bool switch_green)
@@ -1747,6 +1979,8 @@ InputIpAddressDialog::InputIpAddressDialog(wxWindow *parent)
     Layout();
     Fit();
 
+    // for some reason Fit() failed its job here so we do this again
+    SetSize(GetBestSize());
     CentreOnParent(wxBOTH);
     Move(wxPoint(GetScreenPosition().x, GetScreenPosition().y - FromDIP(50)));
     wxGetApp().UpdateDlgDarkUI(this);
@@ -1761,17 +1995,9 @@ InputIpAddressDialog::InputIpAddressDialog(wxWindow *parent)
         m_status_bar->reset();
         EndModal(wxID_YES);
     });
-    Bind(wxEVT_CLOSE_WINDOW, [this](auto& e) {
+    Bind(wxEVT_CLOSE_WINDOW, [this](auto &e) {
         on_cancel();
         closeTimer->Stop();
-    });
-
-    Bind(EVT_UPDATE_TEXT_MSG, &InputIpAddressDialog::update_test_msg_event, this);
-    Bind(EVT_CHECK_IP_ADDRESS_LAYOUT, [this](auto& e) {
-        int mode = e.GetInt();
-        switch_input_panel(mode);
-        Layout();
-        Fit();
     });
 }
 
@@ -1797,6 +2023,7 @@ void InputIpAddressDialog::switch_input_panel(int index)
 
 void InputIpAddressDialog::on_cancel()
 {
+    token_.reset();
     if (m_thread) {
         m_thread->interrupt();
         m_thread->detach();
@@ -1819,8 +2046,13 @@ void InputIpAddressDialog::set_machine_obj(MachineObject* obj)
     m_input_ip->GetTextCtrl()->SetLabelText(m_obj->get_dev_ip());
     m_input_access_code->GetTextCtrl()->SetLabelText(m_obj->get_access_code());
 
+    /* The printer config may be missing for unknown printer types, fall back to a default image,
+       otherwise create_scaled_bitmap() throws and the exception escapes to the message loop */
     std::string img_str = DevPrinterConfigUtil::get_printer_connect_help_img(m_obj->printer_type);
-    auto diagram_bmp = create_scaled_bitmap(img_str + "_en", this, 198);
+    if (img_str.empty()) { img_str = "input_access_code_x1"; }
+
+    std::string language = wxGetApp().app_config->get("language");
+    auto diagram_bmp = create_scaled_bitmap(img_str + (language == "zh_CN" ? "_cn" : "_en"), this, 198);
     m_img_help->SetBitmap(diagram_bmp);
 
 
@@ -1913,7 +2145,9 @@ void InputIpAddressDialog::on_ok(wxMouseEvent& evt)
     Fit();
 
     token_.reset(this, nop_deleter);
-    m_thread = new boost::thread(boost::bind(&InputIpAddressDialog::workerThreadFunc, this, str_ip, str_access_code, str_sn, str_model_id));
+    update_test_msg(_L("connecting..."), true);
+    m_thread = new boost::thread(&InputIpAddressDialog::workerThreadFunc,
+        std::weak_ptr<InputIpAddressDialog>(token_), str_ip, str_access_code, str_sn, str_model_id, current_input_index);
 }
 
 void InputIpAddressDialog::on_send_retry()
@@ -1998,35 +2232,12 @@ void InputIpAddressDialog::on_send_retry()
     m_send_job->start();
 }
 
-void InputIpAddressDialog::update_test_msg_event(wxCommandEvent& evt)
+void InputIpAddressDialog::workerThreadFunc(std::weak_ptr<InputIpAddressDialog> w, std::string str_ip,
+    std::string str_access_code, std::string sn, std::string model_id, int input_index)
 {
-    wxString text = evt.GetString();
-    bool beconnect = evt.GetInt();
-    update_test_msg(text, beconnect);
-    Layout();
-    Fit();
-}
-
-void InputIpAddressDialog::post_update_test_msg(std::weak_ptr<InputIpAddressDialog> w,wxString text, bool beconnect)
-{
-    if (w.expired()) return;
-
-    wxCommandEvent event(EVT_UPDATE_TEXT_MSG);
-    event.SetEventObject(this);
-    event.SetString(text);
-    event.SetInt(beconnect);
-    wxPostEvent(this, event);
-}
-
-void InputIpAddressDialog::workerThreadFunc(std::string str_ip, std::string str_access_code, std::string sn, std::string model_id)
-{
-    std::weak_ptr<InputIpAddressDialog> w = std::weak_ptr<InputIpAddressDialog>(token_);
-
-    post_update_test_msg(w, _L("connecting..."), true);
-
     detectResult detectData;
     auto result = -1;
-    if (current_input_index == 0) {
+    if (input_index == 0) {
 
 #ifdef __APPLE__
         result = -3;
@@ -2039,71 +2250,86 @@ void InputIpAddressDialog::workerThreadFunc(std::string str_ip, std::string str_
         detectData.dev_name = sn;
         detectData.dev_id = sn;
         detectData.connect_type = "lan";
-        detectData.connect_type = "free";
+        detectData.bind_state = "free";
+        detectData.model_id = model_id;
     }
 
-    if (w.expired()) return;
-
-    if (result < 0) {
-        post_update_test_msg(w, wxEmptyString, true);
-        if (result == -1) {
-            post_update_test_msg(w, _L("Failed to connect to printer."), false);
-        }
-        else if (result == -2) {
-            post_update_test_msg(w, _L("Failed to publish login request."), false);
-        }
-        else if (result == -3) {
-            wxCommandEvent event(EVT_CHECK_IP_ADDRESS_LAYOUT);
-            event.SetEventObject(this);
-            event.SetInt(1);
-            wxPostEvent(this, event);
-        }
+    if (w.expired() || wxTheApp == nullptr)
         return;
-    }
 
-    if (detectData.connect_type != "farm") {
-        if (detectData.bind_state == "occupied") {
-            post_update_test_msg(w, wxEmptyString, true);
-            post_update_test_msg(w, _L("The printer has already been bound."), false);
+    wxTheApp->CallAfter([w, result, detectData = std::move(detectData),
+        str_ip = std::move(str_ip), str_access_code = std::move(str_access_code)]() mutable {
+        auto dialog = w.lock();
+        if (!dialog) return;
+
+        if (dialog->m_thread) {
+            dialog->m_thread->join();
+            delete dialog->m_thread;
+            dialog->m_thread = nullptr;
+        }
+
+        if (result < 0) {
+            dialog->update_test_msg(wxEmptyString, true);
+            if (result == -1) {
+                dialog->update_test_msg(_L("Failed to connect to printer."), false);
+            }
+            else if (result == -2) {
+                dialog->update_test_msg(_L("Failed to publish login request."), false);
+            }
+            else if (result == -3) {
+                dialog->switch_input_panel(1);
+                dialog->Layout();
+                dialog->Fit();
+            }
             return;
         }
 
-        if (detectData.connect_type == "cloud") {
-            post_update_test_msg(w, wxEmptyString, true);
-            post_update_test_msg(w, _L("The printer mode is incorrect, please switch to LAN Only."), false);
+        if (detectData.connect_type != "farm") {
+            if (detectData.bind_state == "occupied") {
+                dialog->update_test_msg(wxEmptyString, true);
+                dialog->update_test_msg(_L("The printer has already been bound."), false);
+                return;
+            }
+
+            if (detectData.connect_type == "cloud") {
+                dialog->update_test_msg(wxEmptyString, true);
+                dialog->update_test_msg(_L("The printer mode is incorrect, please switch to LAN Only."), false);
+                return;
+            }
+        }
+
+        DeviceManager* dev = wxGetApp().getDeviceManager();
+        if (!dev) {
+            dialog->update_test_msg(_L("Failed to connect to printer."), false);
             return;
         }
-    }
-    if (w.expired()) return;
 
+        dialog->m_obj = dev->insert_local_device(detectData.dev_name, detectData.dev_id, str_ip,
+            detectData.connect_type, detectData.bind_state, detectData.version,
+            str_access_code, detectData.model_id);
+        if (!dialog->m_obj) {
+            dialog->update_test_msg(_L("Failed to connect to printer."), false);
+            return;
+        }
 
-    DeviceManager* dev = wxGetApp().getDeviceManager();
-    m_obj = dev->insert_local_device(detectData.dev_name, detectData.dev_id, str_ip,
-        detectData.connect_type, detectData.bind_state, detectData.version,
-        str_access_code, detectData.model_id);
+        dialog->m_obj->set_user_access_code(str_access_code);
+        dev->set_selected_machine(dialog->m_obj->get_dev_id());
 
-
-    if (w.expired()) return;
-
-    if (m_obj) {
-        m_obj->set_user_access_code(str_access_code);
-        wxGetApp().getDeviceManager()->set_selected_machine(m_obj->get_dev_id());
-    }
-
-
-    closeCount = 1;
-
-    post_update_test_msg(w, wxEmptyString, true);
-    post_update_test_msg(w, wxString::Format(_L("Connecting to printer... The dialog will close later"), closeCount), true);
-
-    if (w.expired()) return;
+        dialog->closeCount = 1;
+        dialog->update_test_msg(wxEmptyString, true);
+        dialog->update_test_msg(wxString::Format(_L("Connecting to printer... The dialog will close later"), dialog->closeCount), true);
 
 #ifdef __APPLE__
-    wxCommandEvent event(EVT_CLOSE_IPADDRESS_DLG);
-    wxPostEvent(this, event);
+        wxGetApp().CallAfter([w] {
+            if (auto dialog = w.lock()) {
+                dialog->m_status_bar->reset();
+                dialog->EndModal(wxID_YES);
+            }
+        });
 #else
-    closeTimer->Start(1000);
+        dialog->closeTimer->Start(1000);
 #endif
+    });
 }
 
 void InputIpAddressDialog::OnTimer(wxTimerEvent& event) {
@@ -2175,7 +2401,7 @@ void InputIpAddressDialog::on_text(wxCommandEvent &evt)
     }
 
     if (current_input_index == 1){
-        if (str_sn.length() == 15) {
+        if (str_sn.length() == 15 || str_sn.length() == 18) {
             m_button_ok->Enable(true);
             StateColor btn_bg_green(std::pair<wxColour, int>(wxColour(61, 203, 115), StateColor::Pressed), std::pair<wxColour, int>(wxColour(61, 203, 115), StateColor::Hovered),
                                     std::pair<wxColour, int>(AMS_CONTROL_BRAND_COLOUR, StateColor::Normal));
@@ -2279,381 +2505,288 @@ void InputIpAddressDialog::on_dpi_changed(const wxRect& suggested_rect)
 
 void SendFailedConfirm::on_dpi_changed(const wxRect &suggested_rect) {}
 
-
- HelioStatementDialog::HelioStatementDialog(wxWindow *parent /*= nullptr*/)
-    : DPIDialog(static_cast<wxWindow *>(wxGetApp().mainframe), wxID_ANY, _L("Enable Helio"), wxDefaultPosition, wxDefaultSize, wxCAPTION | wxCLOSE_BOX)
+ExpandCenterDialog::ExpandCenterDialog(wxWindow* parent /*= nullptr*/) :
+    DPIDialog(static_cast<wxWindow*>(wxGetApp().mainframe),
+        wxID_ANY,
+        _L("Welcome to Helio Additive"),
+        wxDefaultPosition,
+        wxDefaultSize,
+        wxCAPTION | wxCLOSE_BOX)
 {
-     SetBackgroundColour(*wxWHITE);
-
-     wxBoxSizer *main_sizer = new wxBoxSizer(wxVERTICAL);
-
-     wxPanel* line = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxSize(-1, 1), wxTAB_TRAVERSAL);
-     line->SetBackgroundColour(wxColour(166, 169, 170));
-
-
-
-     m_title = new Label(this, Label::Head_14, _L("Terms of Service"));
-     //m_title->SetForegroundColour(wxColour(0x26, 0x2E, 0x30));
-
-
-
-     Label* m_description_line1 = new Label(this, Label::Body_13,
-                               _L("You are about to enable a third-party software service feature from Helio Additive! Before confirming the use of this feature, please carefully read the following statements."));
-     //m_description_line1->SetForegroundColour(wxColour(144, 144, 144));
-     m_description_line1->SetMinSize(wxSize(FromDIP(680), -1));
-     m_description_line1->SetMaxSize(wxSize(FromDIP(680), -1));
-     m_description_line1->Wrap(FromDIP(680));
-
-     Label *m_description_line2 = new Label(this, Label::Body_13,
-                                            _L("Unless otherwise specified, Bambu Lab only provides support for the software features officially provided. The slicing evaluation and slicing optimization features based on Helio Additive's cloud service in this software will be developed, operated, provided, and maintained by Helio Additive. Helio Additive is responsible for the effectiveness and availability of this service. The optimization feature of this service may modify the default print commands, posing a risk of printer damage. These features will collect necessary user information and data to achieve relevant service functions. Subscriptions and payments may be involved. Please visit Helio Additive and refer to the Helio Additive Privacy Agreement and the Helio Additive User Agreement for detailed information."));
-
-     Label* m_description_line3 = new Label(this, Label::Body_13,
-         _L("Meanwhile, you understand that this product is provided to you \"as is\" based on Helio Additive's services, and Bambu makes no express or implied warranties of any kind, nor can it control the service effects. To the fullest extent permitted by applicable law, Bambu or its licensors/affiliates do not provide any express or implied representations or warranties, including but not limited to warranties regarding merchantability, satisfactory quality, fitness for a particular purpose, accuracy, confidentiality, and non-infringement of third-party rights. Due to the nature of network services, Bambu cannot guarantee that the service will be available at all times, and Bambu reserves the right to terminate the service based on relevant circumstances."));
-
-     Label* m_description_line4 = new Label(this, Label::Body_13,
-         _L("You agree not to use this product and its related updates to engage in the following activities:"));
-
-     Label* m_description_line5 = new Label(this, Label::Body_13,
-         _L("1.Copy or use any part of this product outside the authorized scope of Helio Additive and Bambu."));
-
-     Label* m_description_line6 = new Label(this, Label::Body_13,
-         _L("2.Attempt to disrupt, bypass, alter, invalidate, or evade any Digital Rights Management system related to and/or an integral part of this product."));
-
-     Label* m_description_line7 = new Label(this, Label::Body_13,
-         _L("3.Using this software and services for any improper or illegal activities."));
-
-     m_description_line2->SetMinSize(wxSize(FromDIP(680), -1));
-     m_description_line2->SetMaxSize(wxSize(FromDIP(680), -1));
-     m_description_line2->Wrap(FromDIP(680));
-
-     m_description_line3->SetMinSize(wxSize(FromDIP(680), -1));
-     m_description_line3->SetMaxSize(wxSize(FromDIP(680), -1));
-     m_description_line3->Wrap(FromDIP(680));
-
-     m_description_line4->SetMinSize(wxSize(FromDIP(680), -1));
-     m_description_line4->SetMaxSize(wxSize(FromDIP(680), -1));
-     m_description_line4->Wrap(FromDIP(680));
-
-     m_description_line5->SetMinSize(wxSize(FromDIP(680), -1));
-     m_description_line5->SetMaxSize(wxSize(FromDIP(680), -1));
-     m_description_line5->Wrap(FromDIP(680));
-
-     m_description_line6->SetMinSize(wxSize(FromDIP(680), -1));
-     m_description_line6->SetMaxSize(wxSize(FromDIP(680), -1));
-     m_description_line6->Wrap(FromDIP(680));
-
-     m_description_line7->SetMinSize(wxSize(FromDIP(680), -1));
-     m_description_line7->SetMaxSize(wxSize(FromDIP(680), -1));
-     m_description_line7->Wrap(FromDIP(680));
-
-     auto helio_home_link = new LinkLabel(this, _L("https://www.helioadditive.com/"), "https://www.helioadditive.com/");
-     LinkLabel* helio_privacy_link = nullptr;
-     LinkLabel* helio_tou_link = nullptr;
-
-     if (GUI::wxGetApp().app_config->get("region") == "China") {
-         helio_privacy_link = new LinkLabel(this, _L("Privacy Policy of Helio Additive"), "https://www.helioadditive.com/zh-cn/policies/privacy");
-         helio_tou_link     = new LinkLabel(this, _L("Terms of Use of Helio Additive"), "https://www.helioadditive.com/zh-cn/policies/terms");
-     }
-     else {
-         helio_privacy_link = new LinkLabel(this, _L("Privacy Policy of Helio Additive"), "https://www.helioadditive.com/en-us/policies/privacy");
-         helio_tou_link     = new LinkLabel(this, _L("Terms of Use of Helio Additive"), "https://www.helioadditive.com/en-us/policies/terms");
-     }
-
-
-     helio_home_link->SeLinkLabelFColour(wxColour(0, 119, 250));
-     helio_privacy_link->SeLinkLabelFColour(wxColour(0, 119, 250));
-     helio_tou_link->SeLinkLabelFColour(wxColour(0, 119, 250));
-
-     helio_home_link->getLabel()->SetFont(::Label::Body_13);
-     helio_privacy_link->getLabel()->SetFont(::Label::Body_13);
-     helio_tou_link->getLabel()->SetFont(::Label::Body_13);
-
-     Label *m_description_line8 =
-         new Label(this, Label::Body_13,
-                   _L("When you confirm to enable this feature, it means that you have confirmed and agreed to the above statements."));
-     m_description_line8->SetMinSize(wxSize(FromDIP(680), -1));
-     m_description_line8->SetMaxSize(wxSize(FromDIP(680), -1));
-     m_description_line8->Wrap(FromDIP(680));
-
-
-
-     wxBoxSizer *button_sizer;
-
-     StateColor btn_bg_green(std::pair<wxColour, int>(wxColour(27, 136, 68), StateColor::Pressed), std::pair<wxColour, int>(wxColour(61, 203, 115), StateColor::Hovered),
-                               std::pair<wxColour, int>(AMS_CONTROL_BRAND_COLOUR, StateColor::Normal));
-
-     StateColor btn_bg_white(std::pair<wxColour, int>(wxColour(206, 206, 206), StateColor::Pressed), std::pair<wxColour, int>(wxColour(238, 238, 238), StateColor::Hovered),
-                             std::pair<wxColour, int>(*wxWHITE, StateColor::Normal));
-
-     m_button_confirm = new Button(this, _L("Agree"));
-     m_button_confirm->SetBackgroundColor(btn_bg_green);
-     m_button_confirm->SetBorderColor(*wxWHITE);
-     m_button_confirm->SetTextColor(wxColour(255, 255, 254));
-     m_button_confirm->SetFont(Label::Body_12);
-     m_button_confirm->SetSize(wxSize(FromDIP(58), FromDIP(24)));
-     m_button_confirm->SetMinSize(wxSize(FromDIP(58), FromDIP(24)));
-     m_button_confirm->SetCornerRadius(FromDIP(12));
-     m_button_confirm->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent &e) { EndModal(wxID_OK); });
-
-     m_button_cancel = new Button(this, _L("Cancel"));
-     m_button_cancel->SetBackgroundColor(btn_bg_white);
-     m_button_cancel->SetBorderColor(*wxWHITE);
-     m_button_cancel->SetBorderColor(wxColour(38, 46, 48));
-     m_button_cancel->SetFont(Label::Body_12);
-     m_button_cancel->SetSize(wxSize(FromDIP(58), FromDIP(24)));
-     m_button_cancel->SetMinSize(wxSize(FromDIP(58), FromDIP(24)));
-     m_button_cancel->SetCornerRadius(FromDIP(12));
-     m_button_cancel->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent &e) { EndModal(wxID_NO); });
-
-
-     button_sizer = new wxBoxSizer(wxHORIZONTAL);
-     button_sizer->Add(0, 0, 1, wxEXPAND, 0);
-     button_sizer->Add(m_button_confirm, 0, 0, 0);
-     button_sizer->Add(0, 0, 0, wxLEFT, FromDIP(20));
-     button_sizer->Add(m_button_cancel, 0, 0, 0);
-     button_sizer->Add(0, 0, 0, wxRIGHT, FromDIP(50));
-
-     main_sizer->Add(line, 0, wxEXPAND, 0);
-     main_sizer->Add(0, 0, 0, wxTOP, FromDIP(16));
-     main_sizer->Add(m_title, 0, wxALIGN_CENTER, 0);
-     main_sizer->Add(0, 0, 0, wxTOP, FromDIP(14));
-     main_sizer->Add(m_description_line1, 0, wxLEFT | wxRIGHT, FromDIP(50));
-     main_sizer->Add(0, 0, 0, wxTOP, FromDIP(15));
-     main_sizer->Add(m_description_line2, 0, wxLEFT | wxRIGHT, FromDIP(50));
-     main_sizer->Add(0, 0, 0, wxTOP, FromDIP(15));
-     main_sizer->Add(m_description_line3, 0, wxLEFT | wxRIGHT, FromDIP(50));
-     main_sizer->Add(0, 0, 0, wxTOP, FromDIP(16));
-     main_sizer->Add(m_description_line4, 0, wxLEFT | wxRIGHT, FromDIP(50));
-     main_sizer->Add(0, 0, 0, wxTOP, FromDIP(16));
-     main_sizer->Add(m_description_line5, 0, wxLEFT | wxRIGHT, FromDIP(50));
-     main_sizer->Add(0, 0, 0, wxTOP, FromDIP(8));
-     main_sizer->Add(m_description_line6, 0, wxLEFT | wxRIGHT, FromDIP(50));
-     main_sizer->Add(0, 0, 0, wxTOP, FromDIP(8));
-     main_sizer->Add(m_description_line7, 0, wxLEFT | wxRIGHT, FromDIP(50));
-     main_sizer->Add(0, 0, 0, wxTOP, FromDIP(16));
-     main_sizer->Add(m_description_line8, 0, wxLEFT | wxRIGHT, FromDIP(50));
-     main_sizer->Add(0, 0, 0, wxTOP, FromDIP(16));
-     main_sizer->Add(helio_home_link, 0, wxLEFT | wxRIGHT, FromDIP(50));
-     main_sizer->Add(0, 0, 0, wxTOP, FromDIP(5));
-     main_sizer->Add(helio_privacy_link, 0, wxLEFT | wxRIGHT, FromDIP(50));
-     main_sizer->Add(0, 0, 0, wxTOP, FromDIP(5));
-     main_sizer->Add(helio_tou_link, 0, wxLEFT | wxRIGHT, FromDIP(50));
-     main_sizer->Add(0, 0, 0, wxTOP, FromDIP(15));
-     main_sizer->Add(button_sizer, 0, wxEXPAND, 0);
-     main_sizer->Add(0, 0, 0, wxTOP, FromDIP(16));
-
-     SetSizer(main_sizer);
-     Layout();
-     Fit();
-
-     CentreOnParent();
-     wxGetApp().UpdateDlgDarkUI(this);
- }
-
-void HelioStatementDialog::on_dpi_changed(const wxRect &suggested_rect)
-{
-}
-
- HelioInputDialog::HelioInputDialog(wxWindow *parent /*= nullptr*/)
-    : DPIDialog(static_cast<wxWindow *>(wxGetApp().mainframe), wxID_ANY, _L("Helio Additive"), wxDefaultPosition, wxDefaultSize, wxCAPTION | wxCLOSE_BOX)
-{
-    SetBackgroundColour(*wxWHITE);
-
-    wxBoxSizer *main_sizer = new wxBoxSizer(wxVERTICAL);
-    wxBoxSizer *item_sizer = new wxBoxSizer(wxHORIZONTAL);
-
-    wxPanel *line = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxSize(-1, 1), wxTAB_TRAVERSAL);
-    line->SetBackgroundColour(wxColour(166, 169, 170));
-
-    Label* inout_title = new Label(this, Label::Body_13, _L("Chamber temperature"));
-    inout_title->SetFont(::Label::Head_14);
-    Label *temp_icon = new Label(this, Label::Body_13, wxT("\u00B0C"));
-    temp_icon->SetFont(::Label::Body_14);
-
-    m_input_item = new ::TextInput(this, wxEmptyString, wxEmptyString, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(120), -1), wxTE_PROCESS_ENTER);
-    StateColor input_bg(std::pair<wxColour, int>(wxColour("#F0F0F1"), StateColor::Disabled), std::pair<wxColour, int>(*wxWHITE, StateColor::Enabled));
-    m_input_item->SetBackgroundColor(input_bg);
-    wxTextValidator validator(wxFILTER_NUMERIC);
-    m_input_item->GetTextCtrl()->SetValidator(validator);
-    m_input_item->GetTextCtrl()->SetHint(wxT("5-70"));
-    m_input_item->GetTextCtrl()->SetMaxLength(10);
-    m_input_item->GetTextCtrl()->SetWindowStyle(wxTE_RIGHT);
-
-    item_sizer->Add(inout_title, 0, wxCENTER, 0);
-    item_sizer->Add(0, 0, 1, wxEXPAND, 0);
-    item_sizer->Add(m_input_item, 0, wxCENTER, 0);
-    item_sizer->Add(temp_icon, 0, wxCENTER, 0);
-
-    Label *sub = new Label(this, _L("Note: Please set the above temperature according to the actual situation. The more accurate the data is, the more precise the analysis results will be."));
-    sub->SetForegroundColour(wxColour(144, 144, 144));
-    sub->SetMinSize(wxSize(FromDIP(420), -1));
-    sub->SetMinSize(wxSize(FromDIP(420), -1));
-    sub->Wrap(FromDIP(420));
-
-    auto helio_wiki_link = new LinkLabel(this, _L("How to use Helio"), "https://wiki.helioadditive.com/");
-    helio_wiki_link->SeLinkLabelFColour(wxColour(0, 174, 66));
-
-    helio_wiki_link->Bind(wxEVT_ENTER_WINDOW, [this](auto &e) { SetCursor(wxCURSOR_HAND); });
-    helio_wiki_link->Bind(wxEVT_LEAVE_WINDOW, [this](auto &e) { SetCursor(wxCURSOR_ARROW); });
-
-    wxBoxSizer *button_sizer = new wxBoxSizer(wxHORIZONTAL);
-    StateColor btn_bg_green(std::pair<wxColour, int>(wxColour(27, 136, 68), StateColor::Pressed), std::pair<wxColour, int>(wxColour(61, 203, 115), StateColor::Hovered),
-                            std::pair<wxColour, int>(AMS_CONTROL_BRAND_COLOUR, StateColor::Normal));
-
-
-    m_button_confirm = new Button(this, _L("Confirm"));
-    m_button_confirm->SetBackgroundColor(btn_bg_green);
-    m_button_confirm->SetBorderColor(*wxWHITE);
-    m_button_confirm->SetTextColor(wxColour(255, 255, 254));
-    m_button_confirm->SetFont(Label::Body_12);
-    m_button_confirm->SetSize(wxSize(FromDIP(58), FromDIP(24)));
-    m_button_confirm->SetMinSize(wxSize(FromDIP(58), FromDIP(24)));
-    m_button_confirm->SetCornerRadius(FromDIP(12));
-    m_button_confirm->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent &e) {
-        wxString s   = m_input_item->GetTextCtrl()->GetValue();
-        double   val = 0.0;
-        if (s.ToDouble(&val)) {
-
-            double clamped = val;
-            if (val < 5.0) clamped = 5.0;
-            if (val > 70.0) clamped = 70.0;
-
-            if (clamped != val) {
-                m_isAdjusting = true;
-                m_input_item->GetTextCtrl()->SetValue(wxString::Format("%.2f", clamped));
-                m_input_item->GetTextCtrl()->SetInsertionPointEnd();
-            }
-        }
-        EndModal(wxID_OK);
-    });
-
-    button_sizer->Add(0, 0, 1, wxEXPAND, 0);
-    button_sizer->Add(m_button_confirm, 0, 0, 0);
-    button_sizer->Add(0, 0, 0, wxLEFT, FromDIP(40));
-
-    main_sizer->Add(line, 0, wxEXPAND, 0);
-    main_sizer->Add(0, 0, 0, wxTOP, FromDIP(16));
-    main_sizer->Add(item_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(30));
-    main_sizer->Add(0, 0, 0, wxTOP, FromDIP(16));
-    main_sizer->Add(sub, 0, wxLEFT | wxRIGHT, FromDIP(30));
-    main_sizer->Add(0, 0, 0, wxTOP, FromDIP(12));
-    main_sizer->Add(helio_wiki_link, 0, wxLEFT | wxRIGHT, FromDIP(30));
-    main_sizer->Add(0, 0, 0, wxTOP, FromDIP(16));
-    main_sizer->Add(button_sizer, 0, wxEXPAND, 0);
-    main_sizer->Add(0, 0, 0, wxTOP, FromDIP(16));
-
-    SetSizer(main_sizer);
-    Layout();
-    Fit();
-
-    CentreOnParent();
-    wxGetApp().UpdateDlgDarkUI(this);
-}
-
-bool HelioInputDialog::IsValidFloat(const wxString &text)
-{
-    if (text.IsEmpty()) return true;
-    if (text.Length() == 1 && wxIsdigit(text[0])) {
-        int digit = text[0] - '0';
-        return digit >= 5 && digit <= 9;
-    }
-
-    if (text == ".") return true;
-    double value;
-    if (!text.ToDouble(&value)) return false;
-    return value >= 5.0 && value <= 70.0;
-}
-
-double HelioInputDialog::get_input_data()
-{
-    wxString value = m_input_item->GetTextCtrl()->GetValue();
-
-    if (value == "-" || value.IsEmpty()) {
-        return -1;
-    }
-
-    double temp = 0;
-    if (is_number_regex(value, temp)) {
-        return temp;
-    }
-
-    return -1;
-}
-
-bool HelioInputDialog::is_number_regex(const wxString &str, double &value)
-{
-    std::string s = str.ToStdString();
-    std::regex  pattern("^[-+]?[0-9]*\\.?[0-9]+$");
-
-    if (std::regex_match(s, pattern)) {
-        return str.ToDouble(&value);
-    }
-
-    return false;
-}
-
-void HelioInputDialog::on_dpi_changed(const wxRect &suggested_rect) {}
-
-
-HelioPatNotEnoughDialog::HelioPatNotEnoughDialog(wxWindow* parent /*= nullptr*/)
-    : DPIDialog(static_cast<wxWindow*>(wxGetApp().mainframe), wxID_ANY, wxString("Helio Additive"), wxDefaultPosition, wxDefaultSize, wxCAPTION | wxCLOSE_BOX)
-{
-    SetBackgroundColour(*wxWHITE);
+    // Set Helio icon (not BambuStudio icon)
+    wxBitmap bmp = create_scaled_bitmap("helio_icon", this, 32);
+    wxIcon icon;
+    icon.CopyFromBitmap(bmp);
+    SetIcon(icon);
+
+    // Use Helio dark palette
+    SetBackgroundColour(HELIO_BG_BASE);
 
     wxBoxSizer* main_sizer = new wxBoxSizer(wxVERTICAL);
+
     wxPanel* line = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxSize(-1, 1), wxTAB_TRAVERSAL);
-    line->SetBackgroundColour(wxColour(166, 169, 170));
+    line->SetBackgroundColour(HELIO_BORDER);
 
-    Label* text = new Label(this, Label::Body_13, _L("Failed to obtain Helio PAT. The number of issued PATs has reached the upper limit. Please pay attention to the information on the Helio official website. Click Refresh to get it again once it is available."), LB_AUTO_WRAP);
-    text->SetForegroundColour(wxColour("#6C6C6C"));
-    text->SetMinSize(wxSize(FromDIP(450), -1));
-    text->SetMaxSize(wxSize(FromDIP(450), -1));
-    text->Wrap(FromDIP(450));
+    // Banner image (restored from original)
+    auto sm = create_scaled_bitmap("expand_helio", nullptr, 144);
+    auto expand_image = new wxStaticBitmap(this, wxID_ANY, sm, wxDefaultPosition, wxSize(FromDIP(380), FromDIP(144)));
+    expand_image->SetMinSize(wxSize(FromDIP(380), FromDIP(144)));
+    expand_image->SetMaxSize(wxSize(FromDIP(380), FromDIP(144)));
 
-    auto helio_wiki_link = new LinkLabel(this, _L("Click for more details"), wxGetApp().app_config->get("language") == "zh_CN" ? "https://wiki.helioadditive.com/zh/home" : "https://wiki.helioadditive.com/en/home");
-    helio_wiki_link->SeLinkLabelFColour(wxColour(0, 174, 66));
-    helio_wiki_link->Bind(wxEVT_ENTER_WINDOW, [this](auto& e) { SetCursor(wxCURSOR_HAND); });
-    helio_wiki_link->Bind(wxEVT_LEAVE_WINDOW, [this](auto& e) { SetCursor(wxCURSOR_ARROW); });
+    // Content panel with dark background
+    wxPanel* content_panel = new wxPanel(this);
+    content_panel->SetBackgroundColour(HELIO_BG_BASE);
+    wxBoxSizer* content_sizer = new wxBoxSizer(wxVERTICAL);
 
-    StateColor btn_bg_green(std::pair<wxColour, int>(wxColour(27, 136, 68), StateColor::Pressed), std::pair<wxColour, int>(wxColour(61, 203, 115), StateColor::Hovered),
-        std::pair<wxColour, int>(AMS_CONTROL_BRAND_COLOUR, StateColor::Normal));
+    // Main heading
+    auto main_heading = new Label(content_panel, Label::Head_20, _L("Know Your Print Will Work — Before You Hit Print"));
+    wxFont heading_font = main_heading->GetFont();
+    heading_font.SetWeight(wxFONTWEIGHT_BOLD);
+    main_heading->SetFont(heading_font);
+    main_heading->SetForegroundColour(HELIO_TEXT);
+    
+    // Subheading
+    auto subheading = new Label(content_panel, Label::Body_14, _L("Physics-based analysis and optimization that makes prints faster, stronger, and far more reliable."));
+    subheading->SetForegroundColour(HELIO_MUTED);
+    
+    // Two feature cards side by side
+    wxBoxSizer* cards_sizer = new wxBoxSizer(wxHORIZONTAL);
 
+    // Tooltip text for cards
+    wxString tooltip_text = _L("Unlock a world of faster, more reliable printing with Helio's state of the art physics based 3d printing simulation technology.");
 
-    auto sizer_button = new wxBoxSizer(wxHORIZONTAL);
-    auto m_button_ok = new Button(this, _L("Confirm"));
-    m_button_ok->SetBackgroundColor(btn_bg_green);
-    m_button_ok->SetBorderColor(*wxWHITE);
-    m_button_ok->SetTextColor(wxColour(255, 255, 254));
-    m_button_ok->SetFont(Label::Body_12);
-    m_button_ok->SetSize(wxSize(FromDIP(58), FromDIP(24)));
-    m_button_ok->SetMinSize(wxSize(FromDIP(58), FromDIP(24)));
-    m_button_ok->SetCornerRadius(FromDIP(12));
+    // Feature Card 1 - Fewer Failed Prints
+    wxPanel* card1 = new wxPanel(content_panel);
+    card1->SetBackgroundColour(HELIO_CARD_BG);
+    card1->SetMinSize(wxSize(FromDIP(220), FromDIP(190)));
+    card1->SetToolTip(tooltip_text);
+    wxBoxSizer* card1_sizer = new wxBoxSizer(wxVERTICAL);
+    auto check_icon = new wxStaticBitmap(card1, wxID_ANY, create_scaled_bitmap("helio_feature_shield_check", card1, 48), wxDefaultPosition, wxSize(FromDIP(48), FromDIP(48)), 0);
+    check_icon->SetToolTip(tooltip_text);
+    auto card1_title = new Label(card1, Label::Body_16, _L("Fewer Failed Prints"));
+    card1_title->SetForegroundColour(HELIO_TEXT);
+    wxFont card_title_font = card1_title->GetFont();
+    card_title_font.SetWeight(wxFONTWEIGHT_BOLD);
+    card1_title->SetFont(card_title_font);
+    card1_title->SetToolTip(tooltip_text);
+    auto card1_desc = new Label(card1, Label::Body_12, _L("Catch issues before printing and improve first-try success."));
+    card1_desc->SetForegroundColour(HELIO_MUTED);
+    card1_desc->Wrap(FromDIP(190));
+    card1_desc->SetToolTip(tooltip_text);
+    card1_sizer->Add(check_icon, 0, wxALIGN_CENTER | wxTOP, FromDIP(20));
+    card1_sizer->Add(card1_title, 0, wxALIGN_CENTER | wxTOP, FromDIP(12));
+    card1_sizer->Add(card1_desc, 0, wxALIGN_CENTER | wxALL, FromDIP(15));
+    card1->SetSizer(card1_sizer);
 
-    sizer_button->AddStretchSpacer();
-    sizer_button->Add(m_button_ok, 0, wxALL, FromDIP(5));
+    // Feature Card 2 - Faster Prints, Better Quality
+    wxPanel* card2 = new wxPanel(content_panel);
+    card2->SetBackgroundColour(HELIO_CARD_BG);
+    card2->SetMinSize(wxSize(FromDIP(220), FromDIP(190)));
+    card2->SetToolTip(tooltip_text);
+    wxBoxSizer* card2_sizer = new wxBoxSizer(wxVERTICAL);
+    auto speed_icon = new wxStaticBitmap(card2, wxID_ANY, create_scaled_bitmap("helio_feature_speed", card2, 48), wxDefaultPosition, wxSize(FromDIP(48), FromDIP(48)), 0);
+    speed_icon->SetToolTip(tooltip_text);
+    auto card2_title = new Label(card2, Label::Body_16, _L("Faster Prints, Better Quality"));
+    card2_title->SetForegroundColour(HELIO_TEXT);
+    card2_title->SetFont(card_title_font);
+    card2_title->SetToolTip(tooltip_text);
+    auto card2_desc = new Label(card2, Label::Body_12, _L("Automatically tune speed and extrusion without manual tweaking."));
+    card2_desc->SetForegroundColour(HELIO_MUTED);
+    card2_desc->Wrap(FromDIP(190));
+    card2_desc->SetToolTip(tooltip_text);
+    card2_sizer->Add(speed_icon, 0, wxALIGN_CENTER | wxTOP, FromDIP(20));
+    card2_sizer->Add(card2_title, 0, wxALIGN_CENTER | wxTOP, FromDIP(12));
+    card2_sizer->Add(card2_desc, 0, wxALIGN_CENTER | wxALL, FromDIP(15));
+    card2->SetSizer(card2_sizer);
 
-    m_button_ok->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
-        EndModal(wxID_OK);
-        });
+    cards_sizer->Add(card1, 1, wxEXPAND | wxRIGHT, FromDIP(12));
+    cards_sizer->Add(card2, 1, wxEXPAND, 0);
+
+    content_sizer->Add(main_heading, 0, wxALIGN_LEFT | wxTOP, FromDIP(20));
+    content_sizer->Add(subheading, 0, wxALIGN_LEFT | wxTOP, FromDIP(8));
+    content_sizer->Add(cards_sizer, 0, wxEXPAND | wxTOP, FromDIP(24));
+    content_panel->SetSizer(content_sizer);
+    content_panel->Layout();
+
+    // Enable Helio Additive button (green)
+    StateColor btn_bg_green = StateColor(
+        std::pair<wxColour, int>(wxColour(0, 150, 50), StateColor::Hovered), 
+        std::pair<wxColour, int>(wxColour(0, 174, 66), StateColor::Normal));
+
+    wxBoxSizer* button_sizer = new wxBoxSizer(wxHORIZONTAL);
+    Button* m_button_activate = new Button(this, _L("Enable Helio Additive"));
+    m_button_activate->SetBackgroundColor(btn_bg_green);
+    m_button_activate->SetBorderColor(wxColour(0, 174, 66));
+    // White text for all states
+    StateColor activate_btn_text(std::pair<wxColour, int>(wxColour(255, 255, 254), StateColor::Disabled),
+                                  std::pair<wxColour, int>(wxColour(255, 255, 254), StateColor::Hovered),
+                                  std::pair<wxColour, int>(wxColour(255, 255, 254), StateColor::Pressed),
+                                  std::pair<wxColour, int>(wxColour(255, 255, 254), StateColor::Enabled),
+                                  std::pair<wxColour, int>(wxColour(255, 255, 254), StateColor::Normal));
+    m_button_activate->SetTextColor(activate_btn_text);
+    m_button_activate->SetTextColorNormal(wxColour(255, 255, 254));
+    m_button_activate->SetFont(Label::Body_14);
+    m_button_activate->SetSize(wxSize(FromDIP(300), FromDIP(36)));
+    m_button_activate->SetMinSize(wxSize(FromDIP(300), FromDIP(36)));
+    m_button_activate->SetCornerRadius(FromDIP(4));
+    m_button_activate->SetToolTip(tooltip_text);
+    m_button_activate->Bind(wxEVT_LEFT_DOWN, &ExpandCenterDialog::on_open_expand, this);
+    button_sizer->Add(0, 0, 1, wxEXPAND, 0);
+    button_sizer->Add(m_button_activate, 0, wxALIGN_CENTER, 0);
+    button_sizer->Add(0, 0, 1, wxEXPAND, 0);
+    
+    // Uninstall button - only shown when Helio is already enabled
+    wxBoxSizer* uninstall_sizer = new wxBoxSizer(wxHORIZONTAL);
+    StateColor btn_bg_uninstall(std::pair<wxColour, int>(wxColour(100, 100, 105), StateColor::Hovered),
+                                std::pair<wxColour, int>(wxColour(80, 80, 85), StateColor::Normal));
+    Button* m_button_uninstall = new Button(this, _L("Uninstall"));
+    m_button_uninstall->SetBackgroundColor(btn_bg_uninstall);
+    m_button_uninstall->SetBorderColor(wxColour(130, 130, 135));
+    // Use StateColor for text with bright white for all states
+    StateColor uninstall_btn_text(std::pair<wxColour, int>(wxColour(255, 255, 254), StateColor::Disabled),
+                                  std::pair<wxColour, int>(wxColour(255, 255, 254), StateColor::Hovered),
+                                  std::pair<wxColour, int>(wxColour(255, 255, 254), StateColor::Pressed),
+                                  std::pair<wxColour, int>(wxColour(255, 255, 254), StateColor::Enabled),
+                                  std::pair<wxColour, int>(wxColour(255, 255, 254), StateColor::Normal));
+    m_button_uninstall->SetTextColor(uninstall_btn_text);
+    m_button_uninstall->SetTextColorNormal(wxColour(255, 255, 254));
+    m_button_uninstall->SetFont(Label::Body_13);
+    m_button_uninstall->SetSize(wxSize(FromDIP(120), FromDIP(28)));
+    m_button_uninstall->SetMinSize(wxSize(FromDIP(120), FromDIP(28)));
+    m_button_uninstall->SetCornerRadius(FromDIP(4));
+    m_button_uninstall->Bind(wxEVT_LEFT_DOWN, &ExpandCenterDialog::on_uninstall, this);
+    uninstall_sizer->Add(0, 0, 1, wxEXPAND, 0);
+    uninstall_sizer->Add(m_button_uninstall, 0, wxALIGN_CENTER, 0);
+    uninstall_sizer->Add(0, 0, 1, wxEXPAND, 0);
+    
+    // Only show uninstall button if Helio is already enabled
+    bool helio_enabled = wxGetApp().app_config->get("helio_enable") == "true";
+    if (!helio_enabled) {
+        m_button_uninstall->Hide();
+    }
+    
+    // Microcopy under button with info tooltip
+    wxBoxSizer* microcopy_sizer = new wxBoxSizer(wxHORIZONTAL);
+    auto microcopy_text = new Label(this, Label::Body_12, _L("After slicing, click the Helio button to analyze your print."));
+    microcopy_text->SetForegroundColour(wxColour(160, 160, 160));
+    
+    // Info icon with tooltip
+    auto info_icon = new wxStaticBitmap(this, wxID_ANY, create_scaled_bitmap("more_info", this, 14), wxDefaultPosition, wxSize(FromDIP(14), FromDIP(14)), 0);
+    info_icon->SetToolTip(_L("Helio Additive does not change your printer's firmware."));
+    microcopy_text->SetToolTip(_L("Helio Additive does not change your printer's firmware."));
+    
+    microcopy_sizer->Add(0, 0, 1, wxEXPAND, 0);
+    microcopy_sizer->Add(microcopy_text, 0, wxALIGN_CENTER_VERTICAL, 0);
+    microcopy_sizer->Add(info_icon, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(6));
+    microcopy_sizer->Add(0, 0, 1, wxEXPAND, 0);
+    
+    // Footer text
+    auto footer_text = new Label(this, Label::Body_12, _L("Designed to help prints succeed — even if you're new to 3D printing."));
+    footer_text->SetForegroundColour(wxColour(180, 180, 180));
+    wxBoxSizer* footer_sizer = new wxBoxSizer(wxHORIZONTAL);
+    footer_sizer->Add(0, 0, 1, wxEXPAND, 0);
+    footer_sizer->Add(footer_text, 0, wxALIGN_CENTER, 0);
+    footer_sizer->Add(0, 0, 1, wxEXPAND, 0);
 
     main_sizer->Add(line, 0, wxEXPAND, 0);
-    main_sizer->Add(0, 0, 0, wxTOP, FromDIP(26));
-    main_sizer->Add(text, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(30));
-    main_sizer->Add(0, 0, 0, wxTOP, FromDIP(15));
-    main_sizer->Add(helio_wiki_link, 0, wxLEFT | wxRIGHT, FromDIP(30));
-    main_sizer->Add(0, 0, 0, wxTOP, FromDIP(15));
-    main_sizer->Add(sizer_button, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(30));
+    main_sizer->Add(expand_image, 0, wxALIGN_CENTER | wxTOP, FromDIP(10));
+    main_sizer->Add(content_panel, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(20));
+    main_sizer->Add(0, 0, 0, wxTOP, FromDIP(24));
+    main_sizer->Add(button_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(20));
+    if (helio_enabled) {
+        main_sizer->Add(0, 0, 0, wxTOP, FromDIP(10));
+        main_sizer->Add(uninstall_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(20));
+    }
+    main_sizer->Add(0, 0, 0, wxTOP, FromDIP(8));
+    main_sizer->Add(microcopy_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(20));
+    main_sizer->Add(0, 0, 0, wxTOP, FromDIP(12));
+    main_sizer->Add(footer_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(20));
+    main_sizer->Add(0, 0, 0, wxTOP, FromDIP(20));
 
     SetSizer(main_sizer);
     Layout();
     Fit();
+    CentreOnParent();
 }
 
-HelioPatNotEnoughDialog::~HelioPatNotEnoughDialog() {}
+void ExpandCenterDialog::report_consent_unstall()
+{
+    json consentBody;
+    json formItemArray = json::array();
+    json formItem;
 
-void HelioPatNotEnoughDialog::on_dpi_changed(const wxRect& suggested_rect)
+    formItem["formID"] = "StudioHelioTOU";
+    formItem["op"] = "Withdraw";
+    formItemArray.push_back(formItem);
+
+    formItem.clear();
+    formItem["formID"] = "StudioHelioNotice";
+    formItem["op"] = "Withdraw";
+    formItemArray.push_back(formItem);
+
+    consentBody["version"] = 1;
+    consentBody["scene"] = "helio_enable";
+    consentBody["formList"] = formItemArray;
+
+    json consent;
+    consent["consentBody"] = consentBody.dump();
+    std::string post_body_str = consent.dump();
+
+    NetworkAgent* agent = GUI::wxGetApp().getAgent();
+    BOOST_LOG_TRIVIAL(info) << "client_id:" << wxGetApp().app_config->get("slicer_uuid") << "\nreport_consent:" << post_body_str;
+
+    if (agent && agent->is_user_login())
+        agent->report_consent(post_body_str);
+    else {
+        wxGetApp().report_consent(post_body_str);
+    }
+}
+
+void ExpandCenterDialog::on_dpi_changed(const wxRect& suggested_rect)
 {
 
 }
 
- }} // namespace Slic3r::GUI
+void ExpandCenterDialog::on_open_expand(const wxMouseEvent& evt)
+{
+    EndModal(wxID_CLOSE);
+    HelioStatementDialog dlg;
+    auto res = dlg.ShowModal();
+}
+
+void ExpandCenterDialog::on_uninstall(const wxMouseEvent& evt)
+{
+    // Confirm uninstall
+    MessageDialog confirm_dlg(this, 
+        _L("Are you sure you want to uninstall Helio Additive? This will disable all Helio features."),
+        _L("Uninstall Helio Additive"),
+        wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION);
+    
+    if (confirm_dlg.ShowModal() != wxID_YES) {
+        return;
+    }
+    
+    // Disable Helio
+    wxGetApp().app_config->set_bool("helio_enable", false);
+    
+    // Report consent withdrawal
+    report_consent_unstall();
+    
+    // Track the event
+    if (wxGetApp().getAgent()) {
+        json j;
+        j["operate"] = "switch";
+        j["content"] = "disable";
+        wxGetApp().getAgent()->track_event("helio_state", j.dump());
+    }
+    
+    // Hide the Helio button in main window
+    if (wxGetApp().mainframe->expand_program_holder) {
+        wxGetApp().mainframe->expand_program_holder->ShowExpandButton(wxGetApp().mainframe->expand_helio_id, false);
+        wxGetApp().mainframe->Layout();
+    }
+    
+    EndModal(wxID_OK);
+}
+
+}} // namespace Slic3r::GUI

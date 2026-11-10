@@ -1,10 +1,13 @@
 #include "ClipperUtils.hpp"
 #include "Model.hpp"
 #include "Print.hpp"
+#include "FilamentMixer.hpp"
+#include "SupportRecommendedParams.hpp"
 
 #include <cfloat>
-
-#include <boost/log/trivial.hpp>
+#include <memory>
+#include <set>
+#include "libslic3r/Log.hpp"
 
 namespace Slic3r {
 
@@ -237,7 +240,10 @@ static t_config_option_keys print_config_diffs(
         const ConfigOption *opt_new_filament = std::binary_search(extruder_retract_keys.begin(), extruder_retract_keys.end(), opt_key) ? new_full_config.option(filament_prefix + opt_key) : nullptr;
 
         if (opt_new_filament != nullptr) {
-            compute_filament_override_value(opt_key, opt_old, opt_new, opt_new_filament, new_full_config, print_diff, filament_overrides, filament_maps);
+            std::vector<int> filament_map_indices(filament_maps.size(), 0);
+            for (int i = 0; i < filament_maps.size(); i++)
+                filament_map_indices[i] = filament_maps[i] - 1;
+            compute_filament_override_value(opt_key, opt_old, opt_new, opt_new_filament, new_full_config, print_diff, filament_overrides, filament_map_indices);
         } else if (*opt_new != *opt_old) {
             //BBS: add plate_index logic for wipe_tower_x/wipe_tower_y
             if (!opt_key.compare("wipe_tower_x") || !opt_key.compare("wipe_tower_y")) {
@@ -578,7 +584,11 @@ static inline bool trafos_differ_in_rotation_by_z_and_mirroring_by_xy_only(const
 
 static PrintObjectRegions::BoundingBox transformed_its_bbox2d(const indexed_triangle_set &its, const Transform3f &m, float offset)
 {
-    assert(! its.indices.empty());
+    // Text / modifier volumes can briefly have no triangles (e.g. unrecognized
+    // glyphs reduced to "??" then deleted). indices.front() on an empty vector
+    // is a null deref in MSVC release builds.
+    if (its.indices.empty() || its.vertices.empty())
+        return PrintObjectRegions::BoundingBox();
 
     PrintObjectRegions::BoundingBox bbox(m * its.vertices[its.indices.front()(0)]);
     for (const stl_triangle_vertex_indices &tri : its.indices)
@@ -838,7 +848,7 @@ bool verify_update_print_object_regions(
         for (const PrintObjectRegions::FuzzySkinPaintedRegion &region : layer_range.fuzzy_skin_painted_regions) {
             const PrintRegion &parent_print_region = *region.parent_print_object_region(layer_range);
             PrintRegionConfig  cfg                 = parent_print_region.config();
-            cfg.fuzzy_skin.value                   = FuzzySkinType::All;
+            if (cfg.fuzzy_skin.value != FuzzySkinType::Disabled_fuzzy) cfg.fuzzy_skin.value = FuzzySkinType::All;
             if (cfg != region.region->config()) {
                 // Region configuration changed.
                 if (print_region_ref_cnt(*region.region) == 0) {
@@ -869,7 +879,12 @@ bool verify_update_print_object_regions(
             size_t hash = regions[i]->config_hash();
             size_t j = i;
             for (++ j; j < regions.size() && regions[j]->config_hash() == hash; ++ j)
-                if (regions[i]->config() == regions[j]->config()) {
+                // Same config but different gradient_volume_id is intentional (per-part gradient
+                // splitting) and must NOT be flagged as a merge. When per-part is off all regions
+                // carry an invalid (default) gradient_volume_id, so the AND condition is always
+                // true and behavior matches the legacy check.
+                if (regions[i]->config() == regions[j]->config()
+                    && regions[i]->gradient_volume_id() == regions[j]->gradient_volume_id()) {
                     // Regions were merged. We need to reslice.
                     return false;
                 }
@@ -900,9 +915,13 @@ void update_volume_bboxes(
                     auto it = lower_bound_by_predicate(volumes_old.begin(), volumes_old.end(), [model_volume](PrintObjectRegions::VolumeExtents &l) { return l.volume_id < model_volume->id(); });
                     if (it != volumes_old.end() && it->volume_id == model_volume->id())
                         layer_range.volumes.emplace_back(*it);
-                } else
+                } else {
+                    const indexed_triangle_set &its = model_volume->mesh().its;
+                    if (its.indices.empty() || its.vertices.empty())
+                        continue;
                     layer_range.volumes.push_back({ model_volume->id(),
-                        transformed_its_bbox2d(model_volume->mesh().its, trafo_for_bbox(object_trafo, model_volume->get_matrix(false)), offset) });
+                        transformed_its_bbox2d(its, trafo_for_bbox(object_trafo, model_volume->get_matrix(false)), offset) });
+                }
             }
     } else {
         std::vector<std::vector<PrintObjectRegions::VolumeExtents>> volumes_old;
@@ -961,7 +980,10 @@ static PrintObjectRegions* generate_print_object_regions(
     const float                                  xy_contour_compensation,
     const std::vector<unsigned int>             & painting_extruders,
     std::vector<int>                            & variant_index,
-    const bool                                   has_painted_fuzzy_skin)
+    const bool                                   has_painted_fuzzy_skin,
+    // Per-part gradient: 1-based-indexed bit vector; slot s is per-part-gradient when
+    // slot_per_part_enabled[s-1] is true. Empty / all-false vector preserves legacy behavior.
+    const std::vector<bool>                     &slot_per_part_enabled = {})
 {
     // Reuse the old object or generate a new one.
     auto out = print_object_regions_old ? std::unique_ptr<PrintObjectRegions>(print_object_regions_old) : std::make_unique<PrintObjectRegions>();
@@ -996,17 +1018,66 @@ static PrintObjectRegions* generate_print_object_regions(
     update_volume_bboxes(layer_ranges_regions, out->cached_volume_ids, model_volumes, out->trafo_bboxes, is_mm_painted ? 0.f : std::max(0.f, xy_contour_compensation));
 
     std::vector<PrintRegion*> region_set;
-    auto get_create_region = [&region_set, &all_regions](PrintRegionConfig &&config) -> PrintRegion* {
+    // Look up or create a PrintRegion. The optional volume_tag, when valid (non-zero ObjectID),
+    // augments the lookup key with a per-volume dimension so that two ModelVolumes sharing the
+    // same PrintRegionConfig get separate PrintRegions (and therefore separate LayerRegions).
+    // Default-constructed (invalid) tag preserves the original config-only de-duplication.
+    auto get_create_region = [&region_set, &all_regions](PrintRegionConfig &&config, ObjectID volume_tag = ObjectID()) -> PrintRegion* {
         size_t hash = config.hash();
-        auto it = Slic3r::lower_bound_by_predicate(region_set.begin(), region_set.end(), [&config, hash](const PrintRegion* l) {
-            return l->config_hash() < hash || (l->config_hash() == hash && l->config() < config); });
-        if (it != region_set.end() && (*it)->config_hash() == hash && (*it)->config() == config)
+        auto it = Slic3r::lower_bound_by_predicate(region_set.begin(), region_set.end(), [&config, hash, volume_tag](const PrintRegion* l) {
+            if (l->config_hash() != hash) return l->config_hash() < hash;
+            if (!(l->config() == config)) return l->config() < config;
+            return l->gradient_volume_id() < volume_tag;
+        });
+        if (it != region_set.end()
+            && (*it)->config_hash() == hash
+            && (*it)->config() == config
+            && (*it)->gradient_volume_id() == volume_tag)
             return *it;
         // Insert into a sorted array, it has O(n) complexity, but the calling algorithm has an O(n^2*log(n)) complexity anyways.
-        all_regions.emplace_back(std::make_unique<PrintRegion>(std::move(config), hash, int(all_regions.size())));
+        all_regions.emplace_back(std::make_unique<PrintRegion>(std::move(config), hash, int(all_regions.size()), volume_tag));
         PrintRegion *region = all_regions.back().get();
         region_set.emplace(it, region);
         return region;
+    };
+
+    // Per-part gradient: count how many printable model-part volumes in this object would
+    // be tagged for each per-part-enabled gradient slot. We only tag a region when the slot
+    // has at least 2 users in this object — single-user slots gain nothing from per-volume
+    // splitting and would only add region count overhead.
+    std::vector<int> per_part_volume_users;
+    if (!slot_per_part_enabled.empty()) {
+        per_part_volume_users.assign(slot_per_part_enabled.size(), 0);
+        for (const ModelVolume *mv : model_volumes) {
+            if (! mv->is_model_part())
+                continue;
+            const DynamicPrintConfig *range_cfg = layer_ranges_regions.empty() ? nullptr : layer_ranges_regions.front().config;
+            PrintRegionConfig vol_cfg = region_config_from_model_volume(default_region_config, range_cfg, *mv, num_extruders, variant_index);
+            for (unsigned int s_1based : { (unsigned int)vol_cfg.wall_filament.value,
+                                            (unsigned int)vol_cfg.sparse_infill_filament.value,
+                                            (unsigned int)vol_cfg.solid_infill_filament.value }) {
+                if (s_1based >= 1
+                    && size_t(s_1based - 1) < slot_per_part_enabled.size()
+                    && slot_per_part_enabled[s_1based - 1])
+                    ++per_part_volume_users[s_1based - 1];
+            }
+        }
+    }
+    auto compute_volume_tag = [&](const PrintRegionConfig &cfg, const ModelVolume &mv) -> ObjectID {
+        if (per_part_volume_users.empty())
+            return ObjectID();
+        auto qualifies = [&](unsigned int s_1based) {
+            return s_1based >= 1
+                && size_t(s_1based - 1) < slot_per_part_enabled.size()
+                && slot_per_part_enabled[s_1based - 1]
+                && per_part_volume_users[s_1based - 1] >= 2;
+        };
+        if (qualifies((unsigned int)cfg.wall_filament.value)
+            || qualifies((unsigned int)cfg.sparse_infill_filament.value)
+            || qualifies((unsigned int)cfg.solid_infill_filament.value)) {
+            return mv.id();
+        }
+        return ObjectID();
     };
 
     // Chain the regions in the order they are stored in the volumes list.
@@ -1017,9 +1088,11 @@ static PrintObjectRegions* generate_print_object_regions(
                 if (const PrintObjectRegions::BoundingBox *bbox = find_volume_extents(layer_range, volume); bbox) {
                     if (volume.is_model_part()) {
                         // Add a model volume, assign an existing region or generate a new one.
+                        PrintRegionConfig vol_cfg = region_config_from_model_volume(default_region_config, layer_range.config, volume, num_extruders, variant_index);
+                        ObjectID volume_tag = compute_volume_tag(vol_cfg, volume);
                         layer_range.volume_regions.push_back({
                             &volume, -1,
-                            get_create_region(region_config_from_model_volume(default_region_config, layer_range.config, volume, num_extruders, variant_index)),
+                            get_create_region(std::move(vol_cfg), volume_tag),
                             bbox
                         });
                     } else if (volume.is_negative_volume()) {
@@ -1081,7 +1154,7 @@ static PrintObjectRegions* generate_print_object_regions(
             for (int parent_volume_region_id = 0; parent_volume_region_id < int(layer_range.volume_regions.size()); ++parent_volume_region_id) {
                 if (const PrintObjectRegions::VolumeRegion &parent_volume_region = layer_range.volume_regions[parent_volume_region_id]; parent_volume_region.model_volume->is_model_part() || parent_volume_region.model_volume->is_modifier()) {
                     PrintRegionConfig cfg = parent_volume_region.region->config();
-                    cfg.fuzzy_skin.value  = FuzzySkinType::All;
+                    if (cfg.fuzzy_skin.value != FuzzySkinType::Disabled_fuzzy) cfg.fuzzy_skin.value = FuzzySkinType::All;
                     layer_range.fuzzy_skin_painted_regions.push_back({FuzzySkinParentType::VolumeRegion, parent_volume_region_id, get_create_region(std::move(cfg))});
                 }
             }
@@ -1090,7 +1163,7 @@ static PrintObjectRegions* generate_print_object_regions(
                 const PrintObjectRegions::PaintedRegion &parent_painted_region = layer_range.painted_regions[parent_painted_regions_id];
 
                 PrintRegionConfig cfg = parent_painted_region.region->config();
-                cfg.fuzzy_skin.value  = FuzzySkinType::All;
+                if (cfg.fuzzy_skin.value != FuzzySkinType::Disabled_fuzzy) cfg.fuzzy_skin.value = FuzzySkinType::All;
                 layer_range.fuzzy_skin_painted_regions.push_back({FuzzySkinParentType::PaintedRegion, parent_painted_regions_id, get_create_region(std::move(cfg))});
             }
 
@@ -1101,7 +1174,123 @@ static PrintObjectRegions* generate_print_object_regions(
         }
     }
 
+    // Save the slot_per_part_enabled bit vector that produced these regions, so the
+    // guard in Print::apply can detect changes on the next call (even when
+    // PrintRegionConfig itself did not change). Always write — including an empty
+    // vector when no mixed filament exists — so the snapshot always reflects the
+    // exact input used to generate the current regions.
+    out->last_slot_per_part_enabled = slot_per_part_enabled;
     return out.release();
+}
+
+// 两份 nozzle map 里各耗材是否仍属于同一组；同组内换到哪个具体喷嘴不算变化。
+static bool same_ams_grouping(const std::vector<int> &old_map, const std::vector<int> &new_map, int ams_idx)
+{
+    return old_map.size() == new_map.size() &&
+        std::equal(old_map.begin(), old_map.end(), new_map.begin(),
+                   [ams_idx](int old_nozzle, int new_nozzle) { return (old_nozzle == ams_idx) == (new_nozzle == ams_idx); });
+}
+
+// Materials printed by this object. The effective support gap is stored in PrintObjectConfig, so each object
+// must be classified independently rather than inheriting a plate-wide material combination.
+static std::vector<SupportMaterialProperties> collect_model_filament_materials(const ModelObject &model_object,
+                                                                               const DynamicPrintConfig &full_config)
+{
+    std::vector<SupportMaterialProperties> out;
+    std::set<int> filament_ids;
+    const auto *types = full_config.option<ConfigOptionStrings>("filament_type");
+    const auto *names = full_config.option<ConfigOptionStrings>("filament_settings_id");
+    const GlobalFeatureFilaments global_features = GlobalFeatureFilaments::from_full_config(full_config);
+    auto collect_explicit_filaments = [&filament_ids](const auto &config) {
+        for (const char *key : {"extruder", "wall_filament", "sparse_infill_filament", "solid_infill_filament"}) {
+            if (config.has(key)) {
+                const int filament_id = config.option(key)->getInt();
+                if (filament_id > 0)
+                    filament_ids.insert(filament_id);
+            }
+        }
+    };
+    for (const ModelVolume *mv : model_object.volumes) {
+        if (mv == nullptr)
+            continue;
+        if (mv->is_model_part()) {
+            for (int filament_id : mv->get_extruders(global_features))
+                if (filament_id > 0)
+                    filament_ids.insert(filament_id);
+        } else if (mv->is_modifier())
+            collect_explicit_filaments(mv->config);
+    }
+    for (const auto &layer_range : model_object.layer_config_ranges)
+        collect_explicit_filaments(layer_range.second);
+    out.reserve(filament_ids.size());
+    for (int filament_id : filament_ids) {
+        const size_t idx = size_t(filament_id - 1);
+        SupportMaterialProperties material;
+        if (types != nullptr && idx < types->values.size())
+            material.type = types->values[idx];
+        if (names != nullptr && idx < names->values.size())
+            material.name = support_recommended_material_name(names->values[idx]);
+        // Keep unknown materials: they must fail name/type rules instead of being omitted from "all materials".
+        out.emplace_back(std::move(material));
+    }
+    return out;
+}
+
+struct MultiNozzleSupportCombo
+{
+    bool zero_top    { false };
+    bool zero_bottom { false };
+};
+
+// BBS multi-diameter: the support z distances are resolved per nozzle here, which would override the zero gap a
+// support material combination needs. Only an object whose materials all match the selected interface may use
+// an object-wide zero top or bottom gap.
+static MultiNozzleSupportCombo multi_nozzle_support_combo(const DynamicPrintConfig &full_config, const PrintObjectConfig &object_config,
+                                                          const ModelObject &model_object)
+{
+    MultiNozzleSupportCombo combo;
+    const int interface = object_config.support_interface_filament.value;
+    // Without top interface layers there is no support contact surface to classify. Keep the regular
+    // multi-diameter automatic gap; a default interface is likewise resolved dynamically.
+    if (object_config.support_interface_top_layers.value <= 0 || interface <= 0)
+        return combo;
+
+    const std::vector<SupportMaterialProperties> model_materials =
+        collect_model_filament_materials(model_object, full_config);
+    if (model_materials.empty())
+        return combo;
+
+    const auto *types   = full_config.option<ConfigOptionStrings>("filament_type");
+    const auto *names   = full_config.option<ConfigOptionStrings>("filament_settings_id");
+    const auto *soluble = full_config.option<ConfigOptionBools>("filament_soluble");
+    const auto *support = full_config.option<ConfigOptionBools>("filament_is_support");
+    auto string_at = [](const ConfigOptionStrings *opt, int id) {
+        return opt != nullptr && id > 0 && size_t(id) <= opt->values.size() ? opt->values[id - 1] : std::string();
+    };
+    auto bool_at = [](const ConfigOptionBools *opt, int id) {
+        return opt != nullptr && id > 0 && size_t(id) <= opt->values.size() && opt->values[id - 1];
+    };
+    const SupportMaterialProperties interface_material {
+        support_recommended_material_name(string_at(names, interface)),
+        string_at(types, interface),
+        bool_at(soluble, interface),
+        bool_at(support, interface)
+    };
+
+    const auto       *printer_model_opt = full_config.option<ConfigOptionString>("printer_model");
+    const std::string printer_model     = printer_model_opt != nullptr ? printer_model_opt->value : std::string();
+
+    combo.zero_top = true;
+    combo.zero_bottom = true;
+    for (const SupportMaterialProperties &material : model_materials) {
+        const SupportMaterialCombination material_result =
+            evaluate_support_material_combination(interface_material, material, printer_model);
+        combo.zero_top &= material_result.zero_top;
+        combo.zero_bottom &= material_result.zero_bottom;
+        if (! combo.zero_top && ! combo.zero_bottom)
+            break;
+    }
+    return combo;
 }
 
 Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_config, bool extruder_applied)
@@ -1111,7 +1300,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 #endif /* _DEBUG */
 
     //BBS: add more logs
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", Line %1%: enter")%__LINE__;
+    BOOST_LOG_TRIVIAL(info) << boost::format("enter");
     // Normalize the config.
 	new_full_config.option("print_settings_id",            true);
 	new_full_config.option("filament_settings_id",         true);
@@ -1119,16 +1308,25 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 
     // BBS
     std::vector <unsigned int> used_filaments = this->extruders(true);
+
     std::unordered_set <unsigned int> used_filament_set(used_filaments.begin(), used_filaments.end());
+
+    auto* is_mixed_opt = new_full_config.option<ConfigOptionBools>("filament_is_mixed");
+    auto* comp_strs_opt = new_full_config.option<ConfigOptionStrings>("filament_mixed_components");
+    if (is_mixed_opt && comp_strs_opt && has_any_mixed_filament(is_mixed_opt->values)) {
+        auto expanded = expand_mixed_filaments(used_filaments, is_mixed_opt->values, comp_strs_opt->values);
+        used_filament_set.insert(expanded.begin(), expanded.end());
+    }
 
     //new_full_config.normalize_fdm(used_filaments);
     new_full_config.normalize_fdm_1();
-    t_config_option_keys changed_keys = new_full_config.normalize_fdm_2(objects().size(), used_filaments.size());
+    DynamicConfig changed_keys_ori_values;
+    t_config_option_keys changed_keys = new_full_config.normalize_fdm_2(objects().size(), used_filaments.size(), &changed_keys_ori_values);
     if (changed_keys.size() > 0) {
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", got changed_keys, size=%1%")%changed_keys.size();
+        BOOST_LOG_TRIVIAL(info) << boost::format("got changed_keys, size=%1%")%changed_keys.size();
         for (int i = 0; i < changed_keys.size(); i++)
         {
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", i=%1%, key=%2%")%i %changed_keys[i];
+            BOOST_LOG_TRIVIAL(info) << boost::format("i=%1%, key=%2%")%i %changed_keys[i];
         }
     }
     const ConfigOption* enable_support_option = new_full_config.option("enable_support");
@@ -1141,13 +1339,14 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     bool has_scarf_joint_seam = false;
     {
         std::vector<int> scarf_seam_type = new_full_config.option<ConfigOptionEnumsGeneric>("filament_scarf_seam_type")->values;
-        auto check_object_scarf_seam_type = [](const std::vector<int> scarf_seam_type, const ModelObject *mo) {
+        const GlobalFeatureFilaments global_features = GlobalFeatureFilaments::from_full_config(new_full_config);
+        auto check_object_scarf_seam_type = [&global_features](const std::vector<int> scarf_seam_type, const ModelObject *mo) {
             //get filament scarf seam type
             if (!mo->printable)
                 return false;
             //check volumes
             for (ModelVolume *mv : mo->volumes) {
-               std::vector<int> volume_extruders = mv->get_extruders();
+               std::vector<int> volume_extruders = mv->get_extruders(global_features);
                for (int filament_id : volume_extruders) {
                    if( scarf_seam_type[filament_id - 1] != 0 ) {
                        return true;
@@ -1211,7 +1410,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             new_full_config.set("has_scarf_joint_seam", true);
         }
 
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ", has_scarf_joint_seam:" << has_scarf_joint_seam;
+        BOOST_LOG_TRIVIAL(info) << "has_scarf_joint_seam:" << has_scarf_joint_seam;
     }
 
     if (!has_scarf_joint_seam) { // check scarf seam setting
@@ -1233,46 +1432,88 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             new_full_config.set("has_scarf_joint_seam", true);
         }
 
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ", has_scarf_joint_seam:" << has_scarf_joint_seam;
+        BOOST_LOG_TRIVIAL(info) << "has_scarf_joint_seam:" << has_scarf_joint_seam;
     }
 
     //apply extruder related values
     std::vector<int> print_variant_index;
+    std::vector<std::vector<NozzleVolumeType>> nozzle_volume_types;
+    int extruder_count = 1, extruder_volume_type_count = 1;
+    bool different_extruder = false;
+
+    different_extruder = new_full_config.support_different_extruders(extruder_count);
+    extruder_volume_type_count = new_full_config.get_extruder_nozzle_volume_count(extruder_count, nozzle_volume_types);
     if (!extruder_applied) {
-        new_full_config.update_values_to_printer_extruders(new_full_config, printer_options_with_variant_1, "printer_extruder_id", "printer_extruder_variant");
-        new_full_config.update_values_to_printer_extruders(new_full_config, printer_options_with_variant_2, "printer_extruder_id", "printer_extruder_variant", 2);
-        //update print config related with variants
-        print_variant_index = new_full_config.update_values_to_printer_extruders(new_full_config, print_options_with_variant, "print_extruder_id", "print_extruder_variant");
+        if ((extruder_count > 1) || different_extruder) {
+            new_full_config.update_values_to_printer_extruders(new_full_config, extruder_count, extruder_volume_type_count, nozzle_volume_types, printer_options_with_variant_2, "printer_extruder_id", "printer_extruder_variant", 2);
+            new_full_config.update_values_to_printer_extruders(new_full_config, extruder_count, extruder_volume_type_count, nozzle_volume_types, printer_options_with_variant_1, "printer_extruder_id", "printer_extruder_variant");
+            //update print config related with variants
+            print_variant_index = new_full_config.update_values_to_printer_extruders(new_full_config, extruder_count, extruder_volume_type_count, nozzle_volume_types, print_options_with_variant, "print_extruder_id", "print_extruder_variant");
+        }
+        else
+            print_variant_index.resize(1, 0);
 
         m_ori_full_print_config = new_full_config;
-        new_full_config.update_values_to_printer_extruders_for_multiple_filaments(new_full_config, filament_options_with_variant,  "filament_self_index", "filament_extruder_variant");
+
+        auto group_result = this->get_nozzle_group_result();
+        std::set<std::string> filament_keys = filament_options_with_variant;
+        filament_keys.insert("filament_self_index");
+        if (group_result && group_result->is_support_dynamic_nozzle_map()) {
+            std::unordered_map<int, std::vector<ExtruderNozleInfo>> filament_extruder_map;
+            auto filament_count = m_config.option<ConfigOptionStrings>("filament_type")->size();
+            auto extruder_type  = m_config.option<ConfigOptionEnumsGeneric>("extruder_type")->values;
+
+            for (int fidx = 0; fidx < filament_count; ++fidx) {
+                auto                        used_nozzles = group_result->get_nozzles_for_filament(fidx);
+                std::set<ExtruderNozleInfo> extruder_nozzle_set;
+                for (auto nozzle : used_nozzles) {
+                    ExtruderNozleInfo tmp;
+                    tmp.extruder_type      = ExtruderType(extruder_type[nozzle.extruder_id]);
+                    tmp.nozzle_volume_type = nozzle.volume_type;
+                    extruder_nozzle_set.insert(tmp);
+                }
+                filament_extruder_map[fidx] = std::vector<ExtruderNozleInfo>(extruder_nozzle_set.begin(), extruder_nozzle_set.end());
+            }
+            new_full_config.update_filament_config_values_for_multiple_extruders(m_ori_full_print_config, filament_extruder_map, extruder_count, extruder_volume_type_count,
+                                                                                 filament_keys, "filament_self_index", "filament_extruder_variant");
+        } else if ((extruder_count > 1) || different_extruder) {
+            new_full_config.update_values_to_printer_extruders_for_multiple_filaments(m_ori_full_print_config, extruder_count, extruder_volume_type_count, filament_keys,
+                                                                                      "filament_self_index", "filament_extruder_variant");
+        }
     }
     else {
-        int extruder_count;
-        bool different_extruder = new_full_config.support_different_extruders(extruder_count);
-        print_variant_index.resize(extruder_count);
-        for (int e_index = 0; e_index < extruder_count; e_index++)
+        //should not come here, we can not get the result of print_variant, for the values have been updated
+        //we just use the default values here
+        auto variant_opt = dynamic_cast<const ConfigOptionStrings *>(new_full_config.option("printer_extruder_variant"));
+        print_variant_index.resize(variant_opt->values.size());
+        for (int e_index = 0; e_index < variant_opt->values.size(); e_index++)
         {
             print_variant_index[e_index] = e_index;
         }
     }
-    std::vector<int> filament_maps =  new_full_config.option<ConfigOptionInts>("filament_map")->values;
+    auto opt_filament_map = new_full_config.option<ConfigOptionInts>("filament_map");
+    std::vector<int> filament_maps = opt_filament_map ? opt_filament_map->values : std::vector<int>{1};
 
     // Find modified keys of the various configs. Resolve overrides extruder retract values by filament profiles.
     DynamicPrintConfig   filament_overrides;
     //BBS: add plate index
     t_config_option_keys print_diff       = print_config_diffs(m_config, new_full_config, filament_overrides, this->m_plate_index, filament_maps);
     t_config_option_keys full_config_diff = full_print_config_diffs(m_full_print_config, new_full_config, this->m_plate_index);
+    // multi_nozzle_diameter_mode is project-only and deliberately not part of the static PrintConfig
+    // object layout. Once an old full config exists, only an actual mode transition invalidates slicing.
+    if (m_full_print_config.option("multi_nozzle_diameter_mode") != nullptr &&
+        multi_nozzle_diameter_mode_enabled(m_full_print_config) != multi_nozzle_diameter_mode_enabled(new_full_config))
+        print_diff.emplace_back("multi_nozzle_diameter_mode");
     // Collect changes to object and region configs.
     t_config_option_keys object_diff      = m_default_object_config.diff(new_full_config);
     t_config_option_keys region_diff      = m_default_region_config.diff(new_full_config);
 
     //BBS: process the filament_map related logic
     std::unordered_set<std::string> print_diff_set(print_diff.begin(), print_diff.end());
-    if (print_diff_set.find("filament_map_mode") == print_diff_set.end())
+    if (!print_diff_set.empty() && print_diff_set.find("filament_map_mode") == print_diff_set.end())
     {
         FilamentMapMode map_mode = new_full_config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode", true)->value;
-        if (map_mode < fmmManual) {
+        if (is_auto_filament_map_mode(map_mode)) {
             if (print_diff_set.find("filament_map") != print_diff_set.end()) {
                 print_diff_set.erase("filament_map");
                 //full_config_diff.erase("filament_map");
@@ -1281,11 +1522,52 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                 old_opt->set(new_opt);
                 m_config.filament_map = *new_opt;
             }
+            // With multi-diameter mode on a single-extruder multi-nozzle machine the flow is the user's
+            // per-filament selection rather than a grouping result, so a change must regroup.
+            if (print_diff_set.find("filament_volume_map") != print_diff_set.end() &&
+                !(is_single_ext_multi_nozzle(new_full_config) && multi_nozzle_diameter_mode_enabled(new_full_config))) {
+                print_diff_set.erase("filament_volume_map");
+                //full_config_diff.erase("filament_volume_map");
+                ConfigOptionInts* old_opt = m_full_print_config.option<ConfigOptionInts>("filament_volume_map", true);
+                ConfigOptionInts* new_opt = new_full_config.option<ConfigOptionInts>("filament_volume_map", true);
+                old_opt->set(new_opt);
+                m_config.filament_volume_map = *new_opt;
+            }
+            if (print_diff_set.find("filament_nozzle_map") != print_diff_set.end()) {
+                print_diff_set.erase("filament_nozzle_map");
+                //full_config_diff.erase("filament_nozzle_map");
+                ConfigOptionInts* old_opt = m_full_print_config.option<ConfigOptionInts>("filament_nozzle_map", true);
+                ConfigOptionInts* new_opt = new_full_config.option<ConfigOptionInts>("filament_nozzle_map", true);
+                old_opt->set(new_opt);
+                m_config.filament_nozzle_map = *new_opt;
+            }
         }
         else {
-            print_diff_set.erase("extruder_ams_count");
+            const bool single_ext_multi_nozzle = is_single_ext_multi_nozzle(new_full_config);
+            // 该机型靠 extruder_ams_count 判断外接 AMS，手动模式也要同步到 m_config；其余机型只用于自动分组。
+            if (!single_ext_multi_nozzle)
+                print_diff_set.erase("extruder_ams_count");
+            if (map_mode == fmmManual) {
+                if (single_ext_multi_nozzle && print_diff_set.find("filament_nozzle_map") != print_diff_set.end()) {
+                    ConfigOptionInts* old_opt = m_full_print_config.option<ConfigOptionInts>("filament_nozzle_map", true);
+                    ConfigOptionInts* new_opt = new_full_config.option<ConfigOptionInts>("filament_nozzle_map", true);
+                    // 该机型 filament_map 恒为全 1，AMS 组与固定组的划分只存在于这个 key：
+                    // 手动分组时用户在弹窗里跨组拖动耗材只体现在这里，擦了 psWipeTower 不失效、分组不会重算。
+                    // 组归属没变则只是后端把固定组耗材回写成具体喷嘴号，仍要擦掉，否则每切一次又触发一次。
+                    if (same_ams_grouping(m_config.filament_nozzle_map.values, new_opt->values, get_effective_ams_nozzle_idx(new_full_config))) {
+                        print_diff_set.erase("filament_nozzle_map");
+                        old_opt->set(new_opt);
+                        m_config.filament_nozzle_map = *new_opt;
+                    }
+                } else if (!single_ext_multi_nozzle) {
+                    print_diff_set.erase("filament_nozzle_map");
+                }
+            }
             std::vector<int> old_filament_map = m_config.filament_map.values;
             std::vector<int> new_filament_map = new_full_config.option<ConfigOptionInts>("filament_map", true)->values;
+
+            std::vector<int> old_filament_volume_map = m_config.filament_volume_map.values;
+            std::vector<int> new_filament_volume_map = new_full_config.option<ConfigOptionInts>("filament_volume_map", true)->values;
 
             if (old_filament_map.size() == new_filament_map.size())
             {
@@ -1300,12 +1582,49 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                         break;
                     }
                 }
-                if (same_map)
+                if (same_map) {
                     print_diff_set.erase("filament_map");
+
+                    const auto& retract_keys = print_config_def.extruder_retract_keys();
+                    const std::string filament_prefix = "filament_";
+                    std::vector<int> old_f_map_indices(old_filament_map.size(), 0);
+                    for (size_t i = 0; i < old_filament_map.size(); i++)
+                        old_f_map_indices[i] = old_filament_map[i] - 1;
+
+                    for (const auto& rk : retract_keys) {
+                        if (print_diff_set.find(rk) == print_diff_set.end())
+                            continue;
+                        const ConfigOption* opt_old   = m_config.option(rk);
+                        const ConfigOption* opt_new_m = new_full_config.option(rk);
+                        const ConfigOption* opt_new_f = new_full_config.option(filament_prefix + rk);
+                        if (opt_old && opt_new_m && opt_new_f) {
+                            const auto *filament_values = static_cast<const ConfigOptionVectorBase *>(opt_new_f);
+                            auto old_row_indices = filament_override_default_indices(rk, filament_values->size(), new_full_config, old_f_map_indices);
+                            std::unique_ptr<ConfigOption> opt_recomputed(opt_new_m->clone());
+                            opt_recomputed->apply_override(opt_new_f, old_row_indices);
+                            if (*opt_old == *opt_recomputed)
+                                print_diff_set.erase(rk);
+                        }
+                    }
+                }
             }
         }
         if (print_diff_set.size() != print_diff.size())
             print_diff.assign(print_diff_set.begin(), print_diff_set.end());
+    }
+
+    //filament_map_2
+    m_config.filament_map_2.values = filament_maps;
+    auto opt_extruder_type = dynamic_cast<const ConfigOptionEnumsGeneric*>(new_full_config.option("extruder_type"));
+    auto opt_filament_volume_maps = dynamic_cast<const ConfigOptionInts*>(new_full_config.option("filament_volume_map"));
+    auto opt_nozzle_volume_type = dynamic_cast<const ConfigOptionEnumsGeneric*>(new_full_config.option("nozzle_volume_type"));
+    for (int index = 0; opt_extruder_type && opt_nozzle_volume_type && index < filament_maps.size(); index++)
+    {
+        ExtruderType extruder_type = (ExtruderType)(opt_extruder_type->get_at(filament_maps[index] - 1));
+        NozzleVolumeType nozzle_volume_type = (NozzleVolumeType)(opt_nozzle_volume_type->get_at(filament_maps[index] - 1));
+        if ((extruder_volume_type_count > extruder_count) && opt_filament_volume_maps && (opt_filament_volume_maps->values.size() > index))
+                nozzle_volume_type = (NozzleVolumeType)(opt_filament_volume_maps->values[index]);
+        m_config.filament_map_2.values[index] = new_full_config.get_index_for_extruder(filament_maps[index], "print_extruder_id", extruder_type, nozzle_volume_type, "print_extruder_variant");
     }
 
     // Do not use the ApplyStatus as we will use the max function when updating apply_status.
@@ -1315,7 +1634,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     if (! (print_diff.empty() && object_diff.empty() && region_diff.empty())) {
         update_apply_status(false);
         //BBS: add more logs
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", got print_diff %1%, object_diff %2%, region_diff %3%, set status to APPLY_STATUS_CHANGED")%print_diff.size() %object_diff.size() %region_diff.size();
+        BOOST_LOG_TRIVIAL(info) << boost::format("got print_diff %1%, object_diff %2%, region_diff %3%, set status to APPLY_STATUS_CHANGED")%print_diff.size() %object_diff.size() %region_diff.size();
     }
 
     // Grab the lock for the Print / PrintObject milestones.
@@ -1331,7 +1650,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     bool   num_extruders_changed  = false;
     if (! full_config_diff.empty()) {
         //BBS: add more logs
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: found full_config_diff changed.")%__LINE__;
+        BOOST_LOG_TRIVIAL(info) << boost::format("found full_config_diff changed.");
         update_apply_status(this->invalidate_step(psGCodeExport));
         m_placeholder_parser.clear_config();
         // Set the profile aliases for the PrintBase::output_filename()
@@ -1353,11 +1672,39 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 	    m_default_region_config.apply_only(new_full_config, region_diff, true);
         //m_full_print_config = std::move(new_full_config);
         m_full_print_config = new_full_config;
+        update_filament_self_index_cache();
         if (num_extruders  != m_config.filament_diameter.size()) {
             num_extruders  = m_config.filament_diameter.size();
             num_extruders_changed  = true;
         }
     }
+
+    const bool multi_diameter_mode = multi_nozzle_diameter_mode_enabled(new_full_config);
+    // Reads m_full_print_config, which holds new_full_config from here on: the config normalization below moves
+    // new_full_config into it, and the retune pass after that still calls this.
+    auto apply_multi_diameter_object_tuning =
+        [this, multi_diameter_mode](PrintObjectConfig &config, const ModelObject &model_object,
+                                    double default_support_nozzle) {
+        if (! multi_diameter_mode)
+            return;
+        const unsigned int support_filament = config.support_interface_filament.value > 0 ?
+            (unsigned int) config.support_interface_filament.value :
+            (unsigned int) config.support_filament.value;
+        const double nozzle_diameter = support_filament == 0 && default_support_nozzle > EPSILON ?
+            default_support_nozzle :
+            nozzle_diameter_for_filament(m_config, support_filament);
+        const MultiNozzleSupportCombo combo = multi_nozzle_support_combo(m_full_print_config, config, model_object);
+        config.support_top_z_distance.value = combo.zero_top ? 0. : multi_nozzle_support_z_distance(
+            nozzle_diameter, config.support_top_z_distance.value);
+        config.support_bottom_z_distance.value = combo.zero_bottom ? 0. : multi_nozzle_support_z_distance(
+            nozzle_diameter, config.support_bottom_z_distance.value);
+    };
+    // The support combination also depends on the filament properties, the volume filaments and the printer model,
+    // so the tuning is redone on every apply in multi-diameter mode. An unchanged result diffs empty and
+    // invalidates nothing.
+    const bool multi_diameter_tuning_changed = multi_diameter_mode ||
+        std::find(print_diff.begin(), print_diff.end(), "multi_nozzle_diameter_mode") != print_diff.end() ||
+        std::find(print_diff.begin(), print_diff.end(), "filament_diameter_map") != print_diff.end();
 
     ModelObjectStatusDB model_object_status_db;
 
@@ -1382,11 +1729,15 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         //BBS: replace model custom gcode with current plate custom gcode
         m_model.curr_plate_index = model.curr_plate_index;
         if (m_model.get_curr_plate_custom_gcodes() != model.get_curr_plate_custom_gcodes()) {
+            const CustomGCode::Info &old_custom_gcodes = m_model.get_curr_plate_custom_gcodes();
+            const CustomGCode::Info &new_custom_gcodes = model.get_curr_plate_custom_gcodes();
+            const bool tool_changes_differ = num_extruders > 1 &&
+                custom_per_printz_gcodes_tool_changes_differ(old_custom_gcodes.gcodes, new_custom_gcodes.gcodes);
             update_apply_status(num_extruders_changed ||
                 // Tool change G-codes are applied as color changes for a single extruder printer, no need to invalidate tool ordering.
                 //FIXME The tool ordering may be invalidated unnecessarily if the custom_gcode_per_print_z.mode is not applicable
                 // to the active print / model state, and then it is reset, so it is being applicable, but empty, thus the effect is the same.
-                (num_extruders > 1 && custom_per_printz_gcodes_tool_changes_differ(m_model.get_curr_plate_custom_gcodes().gcodes, model.get_curr_plate_custom_gcodes().gcodes)) ?
+                tool_changes_differ ?
                 // The Tool Ordering and the Wipe Tower are no more valid.
                 this->invalidate_steps({ psWipeTower, psGCodeExport }) :
                 // There is no change in Tool Changes stored in custom_gcode_per_print_z, therefore there is no need to update Tool Ordering.
@@ -1409,10 +1760,10 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 				m_model.objects.back()->set_model(&m_model);
             }
             //BBS: add more logs
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: new model objects added.")%__LINE__;
+            BOOST_LOG_TRIVIAL(info) << boost::format("new model objects added.");
         } else {
             //BBS: add more logs
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: model object changed.")%__LINE__;
+            BOOST_LOG_TRIVIAL(info) << boost::format("model object changed.");
             // Reorder the objects, add new objects.
             // First stop background processing before shuffling or deleting the PrintObjects in the object list.
             this->call_cancel_callback();
@@ -1524,9 +1875,12 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                     this->call_cancel_callback();
                     update_apply_status(false);
                 }
-                // Invalidate just the supports step.
-                for (const PrintObjectStatus &print_object_status : print_objects_range)
+                // Invalidate supports; also prepare_infill when zero-gap contact refinement is active.
+                for (const PrintObjectStatus &print_object_status : print_objects_range) {
                     update_apply_status(print_object_status.print_object->invalidate_step(posSupportMaterial));
+                    if (print_object_status.print_object->config().support_top_z_distance == 0.)
+                        update_apply_status(print_object_status.print_object->invalidate_step(posPrepareInfill));
+                }
                 if (supports_differ) {
                     // Copy just the support volumes.
                     model_volume_list_update_supports(model_object, model_object_new);
@@ -1544,8 +1898,12 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             bool object_config_changed = ! model_object.config.timestamp_matches(model_object_new.config);
 			if (object_config_changed)
 				model_object.config.assign_config(model_object_new.config);
-            if (! object_diff.empty() || object_config_changed || num_extruders_changed ) {
+            if (! object_diff.empty() || object_config_changed || num_extruders_changed || multi_diameter_tuning_changed) {
                 PrintObjectConfig new_config = PrintObject::object_config_from_model_object(m_default_object_config, model_object, num_extruders, print_variant_index);
+                // model_object's volume configs are synchronized below, so classify the incoming object.
+                // Tune with the single-diameter result in force, the same one the retune pass below uses, or
+                // the two passes flip the support gaps back and forth and every apply reslices the plate.
+                apply_multi_diameter_object_tuning(new_config, model_object_new, m_single_diameter_layering_nozzle);
                 for (const PrintObjectStatus &print_object_status : print_object_status_db.get_range(model_object)) {
                     t_config_option_keys diff = print_object_status.print_object->config().diff(new_config);
                     if (! diff.empty()) {
@@ -1610,10 +1968,16 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             // Generate a list of trafos and XY offsets for instances of a ModelObject
             // Producing the config for PrintObject on demand, caching it at print_object_last.
             const PrintObject *print_object_last = nullptr;
-            auto print_object_apply_config = [this, &print_object_last, model_object, num_extruders, &print_variant_index](PrintObject *print_object) {
-                print_object->config_apply(print_object_last ?
-                    print_object_last->config() :
-                    PrintObject::object_config_from_model_object(m_default_object_config, *model_object, num_extruders, print_variant_index));
+            auto print_object_apply_config = [this, &print_object_last, model_object, num_extruders, &print_variant_index,
+                                              &apply_multi_diameter_object_tuning](PrintObject *print_object) {
+                if (print_object_last) {
+                    print_object->config_apply(print_object_last->config());
+                } else {
+                    PrintObjectConfig config = PrintObject::object_config_from_model_object(
+                        m_default_object_config, *model_object, num_extruders, print_variant_index);
+                    apply_multi_diameter_object_tuning(config, *model_object, m_single_diameter_layering_nozzle);
+                    print_object->config_apply(config);
+                }
                 print_object_last = print_object;
             };
             if (old.empty()) {
@@ -1657,7 +2021,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         }
         if (m_objects != print_objects_new) {
             //BBS: add more logs
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: found print object changed.")%__LINE__;
+            BOOST_LOG_TRIVIAL(info) << boost::format("found print object changed.");
             this->call_cancel_callback();
 			update_apply_status(this->invalidate_all_steps());
             m_objects = print_objects_new;
@@ -1688,12 +2052,12 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 
     //BBS: check the config again
     int new_used_filaments = this->extruders(true).size();
-    t_config_option_keys new_changed_keys = new_full_config.normalize_fdm_2(objects().size(), new_used_filaments);
+    t_config_option_keys new_changed_keys   = new_full_config.normalize_fdm_2(objects().size(), new_used_filaments, &changed_keys_ori_values);
     if (new_changed_keys.size() > 0) {
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", got new_changed_keys, size=%1%")%new_changed_keys.size();
+        BOOST_LOG_TRIVIAL(info) << boost::format("got new_changed_keys, size=%1%")%new_changed_keys.size();
         for (int i = 0; i < new_changed_keys.size(); i++)
         {
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", i=%1%, key=%2%")%i %new_changed_keys[i];
+            BOOST_LOG_TRIVIAL(info) << boost::format("i=%1%, key=%2%")%i %new_changed_keys[i];
         }
 
         update_apply_status(false);
@@ -1705,7 +2069,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 
         if (full_config_diff.empty()) {
             //BBS: previous empty
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: full_config_diff previous empty, need to apply now.")%__LINE__;
+            BOOST_LOG_TRIVIAL(info) << boost::format("full_config_diff previous empty, need to apply now.");
 
             m_placeholder_parser.clear_config();
             // Set the profile aliases for the PrintBase::output_filename()
@@ -1722,6 +2086,30 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         // Handle changes to regions config defaults
         m_default_region_config.apply_only(new_full_config, new_changed_keys, true);
         m_full_print_config = std::move(new_full_config);
+        update_filament_self_index_cache();
+    }
+
+    // Per-part gradient: compute the per-slot enable bit vector once for this Print::apply pass.
+    // Used by generate_print_object_regions to decide which volumes deserve their own PrintRegion.
+    std::vector<bool> slot_per_part_enabled;
+    {
+        const auto &is_mixed_vec  = m_config.filament_is_mixed.values;
+        const auto &grad_vec      = m_config.filament_mixed_gradient.values;
+        const auto &per_part_vec  = m_config.filament_mixed_gradient_per_part.values;
+        const auto &components_vec = m_config.filament_mixed_components.values;
+        slot_per_part_enabled.assign(is_mixed_vec.size(), false);
+        for (size_t i = 0; i < is_mixed_vec.size(); ++i) {
+            if (! is_mixed_vec[i])
+                continue;
+            std::vector<unsigned int> comps = parse_mixed_components(i < components_vec.size() ? components_vec[i] : "");
+            if (comps.size() != 2)
+                continue;
+            if (i >= grad_vec.size() || ! grad_vec[i])
+                continue;
+            if (i >= per_part_vec.size() || ! per_part_vec[i])
+                continue;
+            slot_per_part_enabled[i] = true;
+        }
     }
 
     // All regions now have distinct settings.
@@ -1774,7 +2162,81 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                                 update_apply_status((*it)->invalidate_state_by_config_options(old_config, new_config, diff_keys));
                     },
                     print_variant_index)) {
-                // Regions are valid, just keep them.
+                // Per-part gradient: compare the current slot_per_part_enabled bit vector against
+                // the snapshot stored when regions were last generated. Any difference (slot toggle,
+                // per-part moved between slots, eligibility changes via filament_mixed_components /
+                // filament_mixed_gradient / filament_is_mixed) requires region regeneration to
+                // recompute volume tagging. This is more precise than a bool-vs-bool guard, which
+                // missed the case where per-part is moved from one slot to another (both states
+                // had at least one tagged region, so the coarse check did not fire).
+                if (print_object_regions->last_slot_per_part_enabled != slot_per_part_enabled) {
+                    invalidate();
+                    model_object_status.print_object_regions_status = ModelObjectStatus::PrintObjectRegionsStatus::PartiallyValid;
+                    print_regions_reshuffled = true;
+                } else {
+                    // slot_per_part_enabled unchanged, but volume filament assignments may have
+                    // changed (e.g. user switched a volume from physical filament to a mixed slot).
+                    // verify_update_print_object_regions updates the region config in-place but does
+                    // not recompute gradient_volume_id, so we explicitly check tag eligibility against
+                    // the cached regions and force regeneration on mismatch.
+                    // Logic mirrors generate_print_object_regions's per_part_volume_users
+                    // computation and compute_volume_tag lambda — keep both in sync.
+                    bool tag_mismatch = false;
+                    if (!slot_per_part_enabled.empty()) {
+                        const DynamicPrintConfig *range_cfg =
+                            print_object_regions->layer_ranges.empty()
+                                ? nullptr
+                                : print_object_regions->layer_ranges.front().config;
+                        std::vector<int> cur_users(slot_per_part_enabled.size(), 0);
+                        for (const ModelVolume *mv : model_object.volumes) {
+                            if (! mv->is_model_part()) continue;
+                            PrintRegionConfig vol_cfg = region_config_from_model_volume(
+                                m_default_region_config, range_cfg, *mv, num_extruders, print_variant_index);
+                            for (unsigned int s1 : { (unsigned int)vol_cfg.wall_filament.value,
+                                                     (unsigned int)vol_cfg.sparse_infill_filament.value,
+                                                     (unsigned int)vol_cfg.solid_infill_filament.value }) {
+                                if (s1 >= 1 && size_t(s1 - 1) < slot_per_part_enabled.size()
+                                    && slot_per_part_enabled[s1 - 1])
+                                    ++cur_users[s1 - 1];
+                            }
+                        }
+                        for (auto &lr : print_object_regions->layer_ranges) {
+                            for (auto &vr : lr.volume_regions)
+                                if (vr.model_volume->is_model_part() && vr.region) {
+                                    PrintRegionConfig vol_cfg = region_config_from_model_volume(
+                                        m_default_region_config, lr.config, *vr.model_volume,
+                                        num_extruders, print_variant_index);
+                                    bool should_tag = false;
+                                    for (unsigned int s1 : { (unsigned int)vol_cfg.wall_filament.value,
+                                                             (unsigned int)vol_cfg.sparse_infill_filament.value,
+                                                             (unsigned int)vol_cfg.solid_infill_filament.value }) {
+                                        if (s1 >= 1 && size_t(s1 - 1) < slot_per_part_enabled.size()
+                                            && slot_per_part_enabled[s1 - 1] && cur_users[s1 - 1] >= 2) {
+                                            should_tag = true;
+                                            break;
+                                        }
+                                    }
+                                    // Compare exact ObjectID, not just validity. compute_volume_tag's
+                                    // contract is "return mv.id() or invalid ObjectID()", so the cache
+                                    // is consistent only when the tag matches the volume's own id.
+                                    // Guards against future refactors that might shift a tag to refer
+                                    // to a different volume while still keeping it valid.
+                                    ObjectID expected_tag = should_tag ? vr.model_volume->id() : ObjectID();
+                                    if (vr.region->gradient_volume_id() != expected_tag) {
+                                        tag_mismatch = true;
+                                        break;
+                                    }
+                                }
+                            if (tag_mismatch) break;
+                        }
+                    }
+                    if (tag_mismatch) {
+                        invalidate();
+                        model_object_status.print_object_regions_status = ModelObjectStatus::PrintObjectRegionsStatus::PartiallyValid;
+                        print_regions_reshuffled = true;
+                    }
+                }
+                // Otherwise regions are valid, just keep them.
             } else {
                 // Regions were reshuffled.
                 invalidate();
@@ -1796,7 +2258,8 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                 print_object.is_mm_painted() ? 0.f : float(print_object.config().xy_contour_compensation.value),
                 painting_extruders,
                 print_variant_index,
-                print_object.is_fuzzy_skin_painted());
+                print_object.is_fuzzy_skin_painted(),
+                slot_per_part_enabled);
         }
         for (auto it = it_print_object; it != it_print_object_end; ++it)
             if ((*it)->m_shared_regions) {
@@ -1828,6 +2291,37 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             }
     }
 
+    // BBS multi-diameter: a plate printing with one nozzle diameter only is sliced at that nozzle's band height
+    // instead of on the fine grid. Whether it does follows the filaments in use (paint, parts, support), so it
+    // is resolved on every apply; a change puts every object on a different layer stack.
+    if (const double single_nozzle = this->resolve_single_diameter_layering_nozzle();
+        std::abs(single_nozzle - m_single_diameter_layering_nozzle) > EPSILON) {
+        // 0 means the plate is sliced on the fine grid and merged per nozzle.
+        BOOST_LOG_TRIVIAL(info) << KV(log_key::nozzle_diameter, single_nozzle)
+                                << "multi-diameter single nozzle layering changed, previous " << m_single_diameter_layering_nozzle;
+        // Invalidating first stops the background slicing, which reads the value.
+        for (PrintObject *object : m_objects)
+            update_apply_status(object->invalidate_all_steps());
+        m_single_diameter_layering_nozzle = single_nozzle;
+    }
+
+    // The object configs above are tuned with the single-diameter result of the previous apply. Retune an
+    // automatic support filament with the result just resolved, which is the actual nozzle instead of the
+    // printer's first nozzle slot. Also runs when the result drops back to 0, so the gaps follow the slot again.
+    // With an unchanged result both passes agree and nothing is invalidated.
+    if (multi_diameter_mode) {
+        for (PrintObject *object : m_objects) {
+            PrintObjectConfig tuned_config = object->config();
+            apply_multi_diameter_object_tuning(
+                tuned_config, *object->model_object(), m_single_diameter_layering_nozzle);
+            const t_config_option_keys diff = object->config().diff(tuned_config);
+            if (! diff.empty()) {
+                update_apply_status(object->invalidate_state_by_config_options(object->config(), tuned_config, diff));
+                object->config_apply_only(tuned_config, diff, true);
+            }
+        }
+    }
+
     // Update SlicingParameters for each object where the SlicingParameters is not valid.
     // If it is not valid, then it is ensured that PrintObject.m_slicing_params is not in use
     // (posSlicing and posSupportMaterial was invalidated).
@@ -1844,7 +2338,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 	//BBS: add timestamp logic
 	if (apply_status != APPLY_STATUS_UNCHANGED)
 		m_modified_count++;
-	BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: finished,  this %2%, m_modified_count %3%, apply_status %4%, m_support_used %5%")%__LINE__ %this %m_modified_count %apply_status %m_support_used;
+	BOOST_LOG_TRIVIAL(info) << boost::format("finished,  this %1%, m_modified_count %2%, apply_status %3%, m_support_used %4%")%this %m_modified_count %apply_status %m_support_used;
 	return static_cast<ApplyStatus>(apply_status);
 }
 

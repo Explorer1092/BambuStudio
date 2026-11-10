@@ -1,5 +1,7 @@
 #include "SlicingProgressNotification.hpp"
-
+#include "GLCanvas3D.hpp"
+#include "Plater.hpp"
+#include "GCodeViewer.hpp"
 #ifndef IMGUI_DEFINE_MATH_OPERATORS
 #define IMGUI_DEFINE_MATH_OPERATORS
 #endif
@@ -55,7 +57,7 @@ bool NotificationManager::SlicingProgressNotification::set_progress_state(float 
 	if (percent < 0.f)
 		return true;//set_progress_state(SlicingProgressState::SP_CANCELLED);
 	else if (percent >= 1.f) {
-			m_before_complete_start = GLCanvas3D::timestamp_now();
+			m_before_complete_start = canvas_timestamp_now();
 			return set_progress_state(SlicingProgressState::SP_COMPLETED);
 	}
 	else
@@ -109,7 +111,7 @@ bool NotificationManager::SlicingProgressNotification::set_progress_state(Notifi
 	return false;
 }
 
-void NotificationManager::SlicingProgressNotification::set_status_text(const std::string& text)
+void NotificationManager::SlicingProgressNotification::set_status_text(const std::string& text, bool is_helio)
 {
 	switch (m_sp_state)
 	{
@@ -132,7 +134,7 @@ void NotificationManager::SlicingProgressNotification::set_status_text(const std
 		break;
 	case Slic3r::GUI::NotificationManager::SlicingProgressNotification::SlicingProgressState::SP_COMPLETED:
 	{
-		NotificationData data{ NotificationType::SlicingProgress, NotificationLevel::ProgressBarNotificationLevel, 0,  _u8L("Slice ok.") };
+		NotificationData data{ NotificationType::SlicingProgress, NotificationLevel::ProgressBarNotificationLevel, 0,  is_helio?_u8L("Helio action completed successfully."):_u8L("Slice ok.") };
 		update(data);
 		m_state = EState::Shown;
 	}
@@ -374,7 +376,7 @@ void Slic3r::GUI::NotificationManager::SlicingProgressNotification::render_bar(c
 	ImVec2 midPoint = ImVec2(lineStart.x + (lineEnd.x - lineStart.x) * m_percentage, lineEnd.y);
 	ImGui::GetWindowDrawList()->AddRectFilled(lineStart, lineEnd, bg_color);
 	ImGui::GetWindowDrawList()->AddRectFilled(lineStart, midPoint, progress_color);
-	
+
 	// percentage text
 	ImVec2 text_pos = ImVec2(pos.x, pos.y + size.y + m_line_height * 0.2f);
 	std::string text;

@@ -3,6 +3,7 @@
 
 #include "ExPolygon.hpp"
 #include "PrintConfig.hpp"
+#include "libslic3r/Log.hpp"
 
 #define BED_SHRINK_SEQ_PRINT 0
 
@@ -110,6 +111,14 @@ struct ArrangeParams {
     /// pair of items on the print bed in any direction.
     coord_t min_obj_distance = 0;
 
+    /// Optional lower bound for per-item inflation when min_obj_distance == 0.
+    /// 0 means disabled (legacy behavior). When > 0, update_selected_items_inflation
+    /// will clamp ap.inflation up to this value, guaranteeing a minimum visible gap
+    /// between copies even when brim/tree-support are also zero.
+    /// Set by callers that need a guaranteed gap (e.g. FillBedJob for "auto" distance);
+    /// other arrange paths leave it at 0 so legacy spacing is preserved.
+    coord_t min_inflation_floor = 0;
+
     /// The accuracy of optimization.
     /// Goes from 0.0 to 1.0 and scales performance as well
     float accuracy = 1.f;
@@ -127,6 +136,8 @@ struct ArrangeParams {
     bool  is_seq_print                        = false;
     bool  align_to_y_axis                     = false;
     bool  save_svg                            = false;
+    bool  plate_has_tree_support              = false;
+    double brim_max                            = 0;
     float bed_shrink_x = 0.0;
     float bed_shrink_y = 0.0;
     float brim_skirt_distance = 0;
@@ -143,7 +154,7 @@ struct ArrangeParams {
     /// Progress indicator callback called when an object gets packed.
     /// The unsigned argument is the number of items remaining to pack.
     std::function<void(unsigned, std::string)> progressind = [](unsigned st, std::string str = "") {
-        std::cout << "st=" << st << ", " << str << std::endl;
+        BOOST_LOG_TRIVIAL(debug) << "st=" << st << ", " << str;
     };
 
     std::function<void(const ArrangePolygon &)> on_packed;

@@ -7,7 +7,6 @@
 #include <functional>
 
 #include <boost/optional.hpp>
-#include <boost/log/trivial.hpp>
 
 #include <wx/frame.h>
 #include <wx/dialog.h>
@@ -24,6 +23,8 @@
 #include "Event.hpp"
 #include "../libslic3r/libslic3r_version.h"
 #include "../libslic3r/Utils.hpp"
+#include "wxExtensions.hpp"
+#include "libslic3r/Log.hpp"
 
 
 class wxCheckBox;
@@ -117,6 +118,9 @@ wxDECLARE_EVENT(EVT_DPI_CHANGED_SLICER, DpiChangedEvent);
 #endif // !wxVERSION_EQUAL_OR_GREATER_THAN
 
 extern std::deque<wxDialog*> dialogStack;
+// When true, DPIDialog::EndModal bypasses the top-only guard so every nested
+// modal loop can be flagged to exit in one pass (used during app shutdown).
+extern bool dialogStackForceEnd;
 
 template<class P> class DPIAware : public P
 {
@@ -245,6 +249,10 @@ public:
         dialogStack.push_front(this);
         int r = wxDialog::ShowModal();
         dialogStack.pop_front();
+        // During shutdown, close the next dialog now that its loop is the top one.
+        if (dialogStackForceEnd && !dialogStack.empty()) 
+            dialogStack.front()->EndModal(wxID_ABORT);
+
         return r;
     }
 
@@ -346,14 +354,23 @@ public:
 public:
     void EndModal(int retCode) override
     {
-        if (!dialogStack.empty() && dialogStack.front() != this) {
+        if (!dialogStackForceEnd && !dialogStack.empty() && dialogStack.front() != this) {
             // This is a bug in wxWidgets
-            // when the dialog is not top modal dialog, EndModal() just hide dialog without quit 
+            // when the dialog is not top modal dialog, EndModal() just hide dialog without quit
             // the modal event loop. And the modal event loop blocks us from bottom widgets.
             // Solution: let user click it manually or close outside. FIXME
+            // Exception: during shutdown (dialogStackForceEnd) we deliberately flag every
+            // nested loop to exit so they cascade-unwind once this call stack returns.
             BOOST_LOG_TRIVIAL(warning) << "DPIAware::EndModal Error: dialogStack is not empty, but top dialog is not this one. retCode=" << retCode;
             return;
         }
+
+        // Some injected endpoint-DLP agents hook the OS dialog focus-save that Windows runs when a
+        // modal dialog is hidden while an edit control still holds focus, turning it into a blocking
+        // cross-thread SendMessage(WM_GETDLGCODE) that can freeze the UI thread. Move focus onto the
+        // dialog frame first so the hide no longer queries the focused edit control.
+        if (wxWindow *focused = FindFocus(); focused && (focused == this || IsDescendant(focused)))
+            SetFocusIgnoringChildren();
 
         return wxDialog::EndModal(retCode);
     }
@@ -517,6 +534,42 @@ public:
     void increase_count() { ++m_count; }
     void reset_count() { m_count = 0; }
     bool is_first() const { return m_count == 0; }
+};
+
+class WikiPanel : public wxPanel
+{
+public:
+    WikiPanel(wxWindow *parent, const wxString &wiki_text = wxString("Wiki"), const wxString &tooltip = wxEmptyString, const std::string &wiki_url = "https://wiki.bambulab.com");
+    ~WikiPanel() = default;
+
+    bool Show(bool show = true) override;
+    void SetWikiText(const wxString &text);
+    void SetWikiUrl(const std::string &url);
+    void SetTooltip(const wxString &tooltip);
+
+    wxStaticBitmap *GetWikiBitmap() const { return m_wiki_bmp; }
+    wxStaticText   *GetWikiLabel() const { return m_wiki_label; }
+
+    void msw_rescale();
+
+private:
+    void init_components();
+    void setup_layout();
+    void bind_events();
+    void set_hover_state(bool hover);
+    void open_wiki_url();
+
+private:
+    wxStaticBitmap *m_wiki_bmp   = nullptr;
+    wxStaticText   *m_wiki_label = nullptr;
+    wxBoxSizer     *m_main_sizer = nullptr;
+
+    ScalableBitmap *m_wiki_icon       = nullptr;
+    ScalableBitmap *m_wiki_icon_hover = nullptr;
+
+    std::string m_wiki_url;
+    wxString    m_wiki_text;
+    wxString    m_tooltip;
 };
 
 /* Image Generator */

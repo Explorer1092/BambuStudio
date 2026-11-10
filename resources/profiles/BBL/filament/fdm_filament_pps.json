@@ -43,6 +43,47 @@
     "filament_adhesiveness_category": [
         "801"
     ],
+    "filament_dev_chamber_drying_bed_temperature": [
+        "100"
+    ],
+    "filament_dev_ams_drying_time": [
+        "12",
+        "12",
+        "12",
+        "12",
+        "12",
+        "12",
+        "12",
+        "12"
+    ],
+    "filament_dev_ams_drying_ams_limitations": [
+        "-1"
+    ],
+    "filament_dev_ams_drying_heat_distortion_temperature": [
+        "165",
+        "165",
+        "165",
+        "165"
+    ],
+    "filament_dev_drying_cooling_temperature": [
+        "150"
+    ],
+    "filament_dev_ams_drying_temperature": [
+        "65",
+        "85",
+        "65",
+        "85",
+        "85",
+        "85",
+        "65",
+        "65"
+    ],
+    "filament_dev_drying_softening_temperature": [
+        "150",
+        "150",
+        "150",
+        "150"
+    ],
     "hot_plate_temp": [
         "110"
     ],
@@ -77,7 +118,7 @@
         "0"
     ],
     "temperature_vitrification": [
-        "125"
+        "80"
     ],
     "textured_plate_temp": [
         "110"

@@ -26,10 +26,15 @@
 #include "format.hpp"
 #include "MediaPlayCtrl.h"
 #include "MediaFilePanel.h"
+#include "DeviceWeb/DeviceWebHost.hpp"
 #include "Plater.hpp"
 #include "BindDialog.hpp"
 
+#include "DeviceCore/DevFilaSystem.h"
 #include "DeviceCore/DevManager.h"
+#include "DeviceCore/DevHMSQuery.h"
+#include "fila_manager/wgtFilaManagerCloudDispatcher.h"
+#include "libslic3r/Log.hpp"
 
 namespace Slic3r {
 namespace GUI {
@@ -100,10 +105,6 @@ MonitorPanel::MonitorPanel(wxWindow* parent, wxWindowID id, const wxPoint& pos, 
     : wxPanel(parent, id, pos, size, style),
     m_select_machine(SelectMachinePopup(this))
 {
-#ifdef __WINDOWS__
-    SetDoubleBuffered(true);
-#endif //__WINDOWS__
-
     init_bitmap();
 
     init_tabpanel();
@@ -124,16 +125,6 @@ MonitorPanel::MonitorPanel(wxWindow* parent, wxWindowID id, const wxPoint& pos, 
         m_side_tools->start_interval();
         });
 
-    Bind(EVT_ALREADY_READ_HMS, [this](wxCommandEvent& e) {
-        auto key = e.GetString().ToStdString();
-        auto iter = m_hms_panel->temp_hms_list.find(key);
-        if (iter != m_hms_panel->temp_hms_list.end()) {
-            m_hms_panel->temp_hms_list[key].set_read();
-        }
-
-        update_hms_tag();
-        e.Skip();
-        });
 }
 
 MonitorPanel::~MonitorPanel()
@@ -161,12 +152,6 @@ void MonitorPanel::init_timer()
     m_refresh_timer->SetOwner(this);
     m_refresh_timer->Start(REFRESH_INTERVAL);
     if (update_flag) { update_all();}
-
-    Slic3r::DeviceManager* dev = Slic3r::GUI::wxGetApp().getDeviceManager();
-    if (!dev) return;
-    MachineObject *obj_ = dev->get_selected_machine();
-    if (obj_)
-        GUI::wxGetApp().sidebar().load_ams_list(obj_->get_dev_id(), obj_);
 }
 
 void MonitorPanel::init_tabpanel()
@@ -185,7 +170,11 @@ void MonitorPanel::init_tabpanel()
         }
         page->SetFocus();
         update_all();
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << __LINE__ << " select :" << get_string_from_tab(PrinterTab(m_tabpanel->GetSelection()))
+        if (page == m_print_queue_panel) {
+            m_print_queue_panel->NavigateTo("/device_page/print_queue", true);
+            update_print_queue_device(obj);
+        }
+        BOOST_LOG_TRIVIAL(info) << "select :" << get_string_from_tab(PrinterTab(m_tabpanel->GetSelection()))
             << " wxString:" << m_tabpanel->GetPageText(m_tabpanel->GetSelection()).ToStdString();
         NetworkAgent* agent = GUI::wxGetApp().getAgent();
         if (agent) {
@@ -199,7 +188,7 @@ void MonitorPanel::init_tabpanel()
                         count = std::stoi(value);
                     }
                     catch (...) {
-                        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << __LINE__ << " String to integer error!";
+                        BOOST_LOG_TRIVIAL(error) << "String to integer error!";
                         count = 0;
                     }
                 }
@@ -211,6 +200,12 @@ void MonitorPanel::init_tabpanel()
     //m_status_add_machine_panel = new AddMachinePanel(m_tabpanel);
     m_status_info_panel        = new StatusPanel(m_tabpanel);
     m_tabpanel->AddPage(m_status_info_panel, _L("Status"), "", true);
+
+#if STUDIO_ENABLE_PRINT_QUENE
+    m_print_queue_panel = new DeviceWebHost(m_tabpanel, DeviceWebHostMode::PrintQueue,
+                                            "/device_page/print_queue", true);
+    m_tabpanel->AddPage(m_print_queue_panel, _L("Print queue"), "", false);
+#endif
 
     m_media_file_panel = new MediaFilePanel(m_tabpanel);
     m_tabpanel->AddPage(m_media_file_panel, _L("Storage"), "", false);
@@ -236,9 +231,6 @@ void MonitorPanel::set_default()
 
     /* reset side tool*/
     //m_bitmap_wifi_signal->SetBitmap(wxNullBitmap);
-
-    wxGetApp().sidebar().load_ams_list({}, {});
-    wxGetApp().sidebar().update_sync_status(nullptr);
 }
 
 wxWindow* MonitorPanel::create_side_tools()
@@ -279,6 +271,27 @@ void MonitorPanel::msw_rescale()
     Refresh();
 }
 
+void MonitorPanel::on_activate()
+{
+    DeviceManager* device_manager = wxGetApp().getDeviceManager();
+    MachineObject* machine = device_manager ? device_manager->get_selected_machine() : nullptr;
+    if (!machine || !machine->GetFilaSystem())
+        return;
+
+    const auto fila_system = machine->GetFilaSystem();
+    const auto& settings = fila_system->GetAmsSystemSetting();
+    if (!settings.SupportsFilamentTabAutoReadRfid() || !settings.HasFilamentTabAutoReadRfidState())
+        return;
+
+    const auto rfid_refresh_ctrl = fila_system->GetAmsRfidRefreshCtrl();
+    if (!rfid_refresh_ctrl) {
+        return;
+    }
+
+    return;// reset story-7043553223
+    rfid_refresh_ctrl->TriggerRefresh();
+}
+
 void MonitorPanel::select_machine(std::string machine_sn)
 {
     wxCommandEvent *event = new wxCommandEvent(wxEVT_COMMAND_CHOICE_SELECTED);
@@ -298,28 +311,33 @@ void MonitorPanel::on_timer(wxTimerEvent& event)
 void MonitorPanel::on_select_printer(wxCommandEvent& event)
 {
     Slic3r::DeviceManager* dev = Slic3r::GUI::wxGetApp().getDeviceManager();
-    if (!dev) return;
+    if (!dev)
+        return;
 
-    if ( dev->get_selected_machine() && (dev->get_selected_machine()->get_dev_id() != event.GetString().ToStdString()) && m_hms_panel) {
+    const std::string target_machine = event.GetString().ToStdString();
+    if (dev->get_selected_machine() && (dev->get_selected_machine()->get_dev_id() != target_machine) && m_hms_panel) {
         m_hms_panel->clear_hms_tag();
     }
 
-    if (!dev->set_selected_machine(event.GetString().ToStdString()))
+    if (!dev->set_selected_machine(target_machine))
         return;
 
     set_default();
     update_all();
 
     MachineObject *obj_ = dev->get_selected_machine();
-    if (obj_) {
-        obj_->last_cali_version = -1;
-        obj_->reset_pa_cali_history_result();
-        obj_->reset_pa_cali_result();
-        Sidebar &sidebar = GUI::wxGetApp().sidebar();
-        sidebar.load_ams_list(obj_->get_dev_id(), obj_);
-        sidebar.update_sync_status(obj_);
-        sidebar.set_need_auto_sync_after_connect_printer(sidebar.need_auto_sync_extruder_list_after_connect_priner(obj_));
+    if (m_tabpanel->GetCurrentPage() == m_print_queue_panel) {
+        update_print_queue_device(obj_);
     }
+    if (obj_) {
+        obj_->GetCalib()->ResetCalibVersion();
+        obj_->GetCalib()->ResetPAHistory();
+        obj_->GetCalib()->ResetFlowRateResult();
+        GUI::wxGetApp().sidebar().update_sync_status(obj_);
+    }
+
+    if (IsShownOnScreen())
+        on_activate();
 
     Layout();
 }
@@ -365,12 +383,20 @@ void MonitorPanel::update_all()
     if (!obj) {
         show_status((int)MONITOR_NO_PRINTER);
         m_hms_panel->clear_hms_tag();
-        m_tabpanel->GetBtnsListCtrl()->showNewTag(3, false);
+        m_tabpanel->GetBtnsListCtrl()->showNewTag(PT_HMS, 0);
+        m_status_info_panel->m_media_play_ctrl->SetMachineObject(obj);
         m_status_info_panel->update(obj);
+        update_print_queue_device(nullptr);
         return;
     }
 
-    if (obj->connection_type() != last_conn_type) { last_conn_type = obj->connection_type(); }
+    if (m_tabpanel->GetCurrentPage() == m_print_queue_panel) {
+        update_print_queue_device(obj);
+    }
+
+    if (obj->connection_type() != last_conn_type) {
+        last_conn_type = obj->connection_type();
+    }
 
     m_side_tools->update_status(obj);
 
@@ -392,10 +418,13 @@ void MonitorPanel::update_all()
     show_status(MONITOR_NORMAL);
 
     auto current_page = m_tabpanel->GetCurrentPage();
+
     if (current_page == m_status_info_panel) {
-        m_status_info_panel->obj = obj;
-        m_status_info_panel->m_media_play_ctrl->SetMachineObject(obj);
-        m_status_info_panel->update(obj);
+        if (m_status_info_panel->IsShown()) {
+            m_status_info_panel->sync_current_dev(obj);
+            m_status_info_panel->m_media_play_ctrl->SetMachineObject(obj);
+            m_status_info_panel->update(obj);
+        }
     } else if (current_page == m_upgrade_panel) {
         m_upgrade_panel->update(obj);
     } else if (current_page == m_media_file_panel) {
@@ -409,23 +438,17 @@ void MonitorPanel::update_all()
     update_hms_tag();
 }
 
+void MonitorPanel::update_print_queue_device(MachineObject* obj)
+{
+    if (!m_print_queue_panel) return;
+    auto* vm = m_print_queue_panel->GetPrintQueueVM();
+    if (!vm) return;
+    vm->SetDeviceId(obj ? obj->get_dev_id() : std::string());
+}
+
 void MonitorPanel::update_hms_tag()
 {
-    for (auto hmsitem : m_hms_panel->temp_hms_list) {
-
-        if (!obj) { break;}
-
-        const wxString &msg = wxGetApp().get_hms_query()->query_hms_msg(obj->get_dev_id(), hmsitem.second.get_long_error_code());
-        if (msg.empty()){ continue;} /*STUDIO-10363 it's hidden message*/
-
-        if (!hmsitem.second.has_read()) {
-            //show HMS new tag
-            m_tabpanel->GetBtnsListCtrl()->showNewTag(3, true);
-            return;
-        }
-    }
-
-    m_tabpanel->GetBtnsListCtrl()->showNewTag(3, false);
+    m_tabpanel->GetBtnsListCtrl()->showNewTag(PT_HMS, (int)m_hms_panel->temp_hms_list.size());
 }
 
 bool MonitorPanel::Show(bool show)
@@ -437,6 +460,8 @@ bool MonitorPanel::Show(bool show)
     DeviceManager* dev = Slic3r::GUI::wxGetApp().getDeviceManager();
     if (show) {
         start_update();
+        if (StatusPanel* sp = get_status_panel())
+            sp->update_ctrl_area_masks();
 
         m_refresh_timer->Stop();
         m_refresh_timer->SetOwner(this);
@@ -448,17 +473,16 @@ bool MonitorPanel::Show(bool show)
             obj = dev->get_selected_machine();
             if (obj == nullptr) {
                 dev->load_last_machine();
-                obj = dev->get_selected_machine();
-                if (obj && obj->is_info_ready(false))
-                    GUI::wxGetApp().sidebar().load_ams_list(obj->get_dev_id(), obj);
             } else {
                 obj->reset_update_time();
-                //select_machine(obj->get_dev_id());
             }
         }
+
     } else {
         stop_update();
         m_refresh_timer->Stop();
+        if (StatusPanel* sp = get_status_panel())
+            sp->hide_ctrl_area_overlays();
     }
     return wxPanel::Show(show);
 }
@@ -470,7 +494,8 @@ void MonitorPanel::show_status(int status)
     if ((last_status & (int)MonitorStatus::MONITOR_CONNECTING) != 0) {
         NetworkAgent* agent = wxGetApp().getAgent();
         json j;
-        j["dev_id"] = obj ? obj->get_dev_id() : "obj_nullptr";
+        //j["dev_id"] = obj ? obj->get_dev_id() : "obj_nullptr";
+        j["dev_id"] = "";
         if ((status & (int)MonitorStatus::MONITOR_DISCONNECTED) != 0) {
             j["result"] = "failed";
             if (agent) {
@@ -527,6 +552,10 @@ std::string MonitorPanel::get_string_from_tab(PrinterTab tab)
         return "update";
     case PT_HMS:
         return "HMS";
+#if STUDIO_ENABLE_PRINT_QUENE
+    case PT_PRINT_QUEUE:
+        return "print_queue";
+#endif
     case PT_DEBUG:
         return "debug";
     default:
@@ -544,6 +573,16 @@ void MonitorPanel::jump_to_HMS()
         m_tabpanel->SetSelection(PT_HMS);
 }
 
+void MonitorPanel::jump_to_Upgrade()
+{
+    if (this->IsShown()) {
+        auto page = m_tabpanel->GetCurrentPage();
+        if (page && page != m_upgrade_panel) {
+            m_tabpanel->SetSelection(PT_UPDATE);
+        }
+    }
+}
+
 void MonitorPanel::jump_to_LiveView()
 {
     if (!this->IsShown()) { return; }
@@ -555,6 +594,36 @@ void MonitorPanel::jump_to_LiveView()
     }
 
     m_status_info_panel->get_media_play_ctrl()->jump_to_play();
+}
+
+void MonitorPanel::jump_to_Rack()
+{
+    if (!this->IsShown()) {
+        return;
+    }
+
+    auto page = m_tabpanel->GetCurrentPage();
+    if (page && page != m_status_info_panel) {
+        m_tabpanel->SetSelection(PT_STATUS);
+    }
+
+    m_status_info_panel->jump_to_Rack();
+}
+
+void MonitorPanel::jump_to_print_queue()
+{
+    if (!m_print_queue_panel) { return; }
+
+    // Re-selecting the current page is a no-op, so refresh it explicitly.
+    if (m_tabpanel->GetCurrentPage() == m_print_queue_panel) {
+        m_print_queue_panel->NavigateTo("/device_page/print_queue", true);
+        update_print_queue_device(obj);
+    }
+#if STUDIO_ENABLE_PRINT_QUENE
+    else {
+        m_tabpanel->SetSelection(PT_PRINT_QUEUE);
+    }
+#endif
 }
 
 } // GUI

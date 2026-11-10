@@ -15,6 +15,8 @@
 #include "Plater.hpp"
 #include "MainFrame.hpp"
 #include "format.hpp"
+#include "GCodeViewer.hpp"
+#include "slic3r/GUI/GCodeRenderer/BaseRenderer.hpp"
 
 #include <wx/listbook.h>
 #include <wx/notebook.h>
@@ -30,6 +32,7 @@
 #include "libslic3r/Print.hpp"
 #include "libslic3r/SLAPrint.hpp"
 #include "NotificationManager.hpp"
+#include "libslic3r/Log.hpp"
 
 #ifdef _WIN32
 #include "BitmapComboBox.hpp"
@@ -295,7 +298,6 @@ bool Preview::init(wxWindow* parent, Bed3D& bed, Model* model)
     m_canvas->set_model(model);
     m_canvas->set_process(m_process);
     m_canvas->set_type(GLCanvas3D::ECanvasType::CanvasPreview);
-    m_canvas->enable_legend_texture(true);
 
     //BBS: GUI refactor: GLToolbar
     if (wxGetApp().is_editor()) {
@@ -364,7 +366,7 @@ void Preview::load_print(bool keep_z_range, bool only_gcode)
 //BBS: add only gcode mode
 void Preview::reload_print(bool keep_volumes, bool only_gcode)
 {
-    BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(" %1%: enter, keep_volumes %2%")%__LINE__ %keep_volumes;
+    BOOST_LOG_TRIVIAL(debug) << boost::format("enter, keep_volumes %1%")%keep_volumes;
 #ifdef __linux__
     // We are getting mysterious crashes on Linux in gtk due to OpenGL context activation GH #1874 #1955.
     // So we are applying a workaround here: a delayed release of OpenGL vertex buffers.
@@ -396,7 +398,7 @@ void Preview::reload_print(bool keep_volumes, bool only_gcode)
 //BBS: add only gcode mode
 void Preview::refresh_print()
 {
-    BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(" %1%: enter, current m_loaded_print %2%")%__LINE__ %m_loaded_print;
+    BOOST_LOG_TRIVIAL(debug) << boost::format("enter, current m_loaded_print %1%")%m_loaded_print;
     //BBS: add m_loaded_print logic
     //m_loaded = false;
     m_loaded_print = nullptr;
@@ -405,7 +407,7 @@ void Preview::refresh_print()
         return;
 
     load_print(true, m_only_gcode);
-    BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(" %1%: exit")%__LINE__;
+    BOOST_LOG_TRIVIAL(debug) << boost::format("exit");
 }
 
 //BBS: always load shell at preview
@@ -435,7 +437,7 @@ void Preview::sys_color_changed()
     // m_layers_slider->sys_color_changed();
 }
 
-void Preview::on_tick_changed(Type type)
+void Preview::on_tick_changed(CustomGCode::Type type)
 {
     //if (type == Type::PausePrint) {
     //    m_schedule_background_process();
@@ -475,23 +477,6 @@ void Preview::on_size(wxSizeEvent& evt)
 {
     evt.Skip();
     Refresh();
-}
-
-void Preview::check_layers_slider_values(std::vector<CustomGCode::Item>& ticks_from_model, const std::vector<double>& layers_z)
-{
-    // All ticks that would end up outside the slider range should be erased.
-    // TODO: this should be placed into more appropriate part of code,
-    // this function is e.g. not called when the last object is deleted
-    unsigned int old_size = ticks_from_model.size();
-    ticks_from_model.erase(std::remove_if(ticks_from_model.begin(), ticks_from_model.end(),
-                     [layers_z](CustomGCode::Item val)
-        {
-            auto it = std::lower_bound(layers_z.begin(), layers_z.end(), val.print_z - epsilon());
-            return it == layers_z.end();
-        }),
-        ticks_from_model.end());
-    if (ticks_from_model.size() != old_size)
-        m_schedule_background_process();
 }
 
 // Find an index of a value in a sorted vector, which is in <z-eps, z+eps>.
@@ -612,8 +597,6 @@ void Preview::update_layers_slider(const std::vector<double>& layers_z, bool kee
         ticks_info_from_curr_plate.mode   = CustomGCode::Mode::SingleExtruder;
         ticks_info_from_curr_plate.gcodes = m_canvas->get_custom_gcode_per_print_z();
     }
-    check_layers_slider_values(ticks_info_from_curr_plate.gcodes, layers_z);
-
     // first of all update extruder colors to avoid crash, when we are switching printer preset from MM to SM
     m_layers_slider->SetExtruderColors(plater->get_extruder_colors_from_plater_config(wxGetApp().is_editor() ? nullptr : m_gcode_result));
     m_layers_slider->SetSliderValues(layers_z);
@@ -642,7 +625,11 @@ void Preview::update_layers_slider(const std::vector<double>& layers_z, bool kee
     m_layers_slider->SetTicksValues(ticks_info_from_curr_plate);
 
     auto print_mode_stat = m_gcode_result->print_statistics.modes.front();
-    m_layers_slider->SetLayersTimes(print_mode_stat.layers_times, print_mode_stat.time);
+    // The slider has one tick per extrusion Z, which mixed-color sublayers make finer than the
+    // logical layers layers_times is built from. Prefer the matching partition when it exists.
+    const std::vector<float>& slider_layers_times = print_mode_stat.preview_layers_times.empty() ?
+        print_mode_stat.layers_times : print_mode_stat.preview_layers_times;
+    m_layers_slider->SetLayersTimes(slider_layers_times, print_mode_stat.time);
 
     // Suggest the auto color change, if model looks like sign
     if (m_layers_slider->IsNewPrint()) {
@@ -690,9 +677,9 @@ void Preview::load_print_as_fff(bool keep_z_range, bool only_gcode)
 
     //BBS: add m_loaded_print logic
     const Print *print = m_process->fff_print();
-    BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(" %1%: previous print %2%, new print %3%")%__LINE__ %m_loaded_print %print;
+    BOOST_LOG_TRIVIAL(debug) << boost::format("previous print %1%, new print %2%")%m_loaded_print %print;
     if ((m_loaded_print&&(m_loaded_print == print)) || m_process->current_printer_technology() != ptFFF) {
-        BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(" %1%: already loaded before, return directly")%__LINE__;
+        BOOST_LOG_TRIVIAL(debug) << boost::format("already loaded before, return directly");
         return;
     }
 
@@ -702,8 +689,8 @@ void Preview::load_print_as_fff(bool keep_z_range, bool only_gcode)
     bool has_layers = false;
     //BBS: always load shell at preview
     load_shells(*print, true);
-    BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(" %1%: print: %2%, gcode_result %3%, check started")%__LINE__ %print %m_gcode_result;
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: print is step done, posSlice %2%, posSupportMaterial %3%, psGCodeExport %4%") % __LINE__ % print->is_step_done(posSlice) %print->is_step_done(posSupportMaterial) % print->is_step_done(psGCodeExport);
+    BOOST_LOG_TRIVIAL(debug) << boost::format("print: %1%, gcode_result %2%, check started")%print %m_gcode_result;
+    BOOST_LOG_TRIVIAL(info) << boost::format("print is step done, posSlice %1%, posSupportMaterial %2%, psGCodeExport %3%")% print->is_step_done(posSlice) %print->is_step_done(posSupportMaterial) % print->is_step_done(psGCodeExport);
     if (print->is_step_done(posSlice)) {
         for (const PrintObject* print_object : print->objects())
             if (! print_object->layers().empty()) {
@@ -720,8 +707,8 @@ void Preview::load_print_as_fff(bool keep_z_range, bool only_gcode)
     }
 
     //BBS: support preview gcode directly even if no slicing
-    bool directly_preview = print->is_step_done(psGCodeExport) && !m_gcode_result->moves.empty();
-    BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": directly_preview: %1%, gcode_result moves %2%, has_layers %3%") % directly_preview % m_gcode_result->moves.size() %has_layers;
+    bool directly_preview = (only_gcode || print->is_step_done(psGCodeExport)) && !m_gcode_result->moves.empty();
+    BOOST_LOG_TRIVIAL(debug) << boost::format("directly_preview: %1%, gcode_result moves %2%, has_layers %3%") % directly_preview % m_gcode_result->moves.size() %has_layers;
     if (wxGetApp().is_editor() && !has_layers && !directly_preview) {
         show_sliders(false);
         m_canvas_widget->Refresh();
@@ -731,14 +718,15 @@ void Preview::load_print_as_fff(bool keep_z_range, bool only_gcode)
     else if (directly_preview && !has_layers)
         keep_z_range = false;
 
-    GCodeViewer::EViewType gcode_view_type = m_canvas->get_gcode_view_preview_type();
+    const auto& t_gcode_viewer = m_canvas->get_gcode_viewer();
+    gcode::EViewType gcode_view_type = t_gcode_viewer.get_view_type();
     bool gcode_preview_data_valid = !m_gcode_result->moves.empty();
 
     // Collect colors per extruder.
     std::vector<std::string> colors;
     std::vector<CustomGCode::Item> color_print_values = {};
     // set color print values, if it si selected "ColorPrint" view type
-    if (gcode_view_type == GCodeViewer::EViewType::ColorPrint) {
+    if (gcode_view_type == gcode::EViewType::ColorPrint) {
         colors = wxGetApp().plater()->get_colors_for_color_print(m_gcode_result);
 
         if (!gcode_preview_data_valid) {
@@ -750,7 +738,7 @@ void Preview::load_print_as_fff(bool keep_z_range, bool only_gcode)
             colors.push_back("#808080"); // gray color for pause print or custom G-code
         }
     }
-    else if (gcode_preview_data_valid || gcode_view_type == GCodeViewer::EViewType::Tool) {
+    else if (gcode_preview_data_valid || gcode_view_type == gcode::EViewType::Tool) {
         colors = wxGetApp().plater()->get_extruder_colors_from_plater_config(m_gcode_result);
         color_print_values.clear();
     }
@@ -760,10 +748,10 @@ void Preview::load_print_as_fff(bool keep_z_range, bool only_gcode)
     if (IsShown()) {
         m_canvas->set_selected_extruder(0);
         bool is_slice_result_valid = wxGetApp().plater()->get_partplate_list().get_curr_plate()->is_slice_result_valid();
-        if (gcode_preview_data_valid && (is_slice_result_valid || m_only_gcode)) {
+        if (gcode_preview_data_valid && (is_slice_result_valid || only_gcode)) {
             // Load the real G-code preview.
             //BBS: add more log
-            BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": will load gcode_preview from result, moves count %1%") % m_gcode_result->moves.size();
+            BOOST_LOG_TRIVIAL(debug) << boost::format("will load gcode_preview from result, moves count %1%") % m_gcode_result->moves.size();
             //BBS: add only gcode mode
             m_canvas->load_gcode_preview(*m_gcode_result, colors, only_gcode);
             //BBS show sliders
@@ -857,7 +845,6 @@ bool AssembleView::init(wxWindow* parent, Bed3D& bed, Model* model, DynamicPrint
     m_canvas->enable_slope(false);
     //BBS: GUI refactor: GLToolbar
     m_canvas->enable_return_toolbar(true);
-    //m_canvas->set_show_world_axes(true);//wait for GitHub users to see if they have this requirement
     // BBS: set volume_selection_mode to Volume
     //same to 3d //m_canvas->get_selection().set_volume_selection_mode(Selection::Instance);
     //m_canvas->get_selection().lock_volume_selection_mode();

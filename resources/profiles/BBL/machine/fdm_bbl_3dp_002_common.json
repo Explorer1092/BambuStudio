@@ -61,8 +61,18 @@
         "0",
         "0"
     ],
+    "extruder_max_nozzle_count": [
+        "1",
+        "1"
+    ],
     "head_wrap_detect_zone": [],
     "hotend_cooling_rate": [
+        "2",
+        "2",
+        "2",
+        "2"
+    ],
+    "hotend_cooling_rate_on_rack": [
         "2",
         "2",
         "2",
@@ -252,12 +262,6 @@
         "2",
         "1",
         "2"
-    ],
-    "nozzle_type": [
-        "hardened_steel",
-        "hardened_steel",
-        "hardened_steel",
-        "hardened_steel"
     ],
     "nozzle_volume": [
         "92",

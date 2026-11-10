@@ -15,6 +15,7 @@ using nlohmann::json;
 
 #include <functional>
 #include <deque>
+#include "libslic3r/Log.hpp"
 
 wxDECLARE_EVENT(EVT_STATUS_CHANGED, wxCommandEvent);
 wxDECLARE_EVENT(EVT_MODE_CHANGED, wxCommandEvent);
@@ -253,6 +254,10 @@ public:
 
     void CancelUploadTask(bool send_cancel_req = true);
 
+    static bool isRetryOnError(int error_code) {
+        return error_code == ERROR_TIME_OUT;
+    }
+
 private:
     void BuildGroups();
 
@@ -298,6 +303,7 @@ private:
                     result = n == 0 ? result : n;
                 }
                 catch (...) {
+                    BOOST_LOG_TRIVIAL(warning) << Slic3r::current_exception_message();
                     result = ERROR_JSON;
                 }
             }
@@ -321,6 +327,7 @@ private:
                     result = n == 0 ? result : n;
                 }
                 catch (...) {
+                    BOOST_LOG_TRIVIAL(warning) << Slic3r::current_exception_message();
                     result = ERROR_JSON;
                 }
             }

@@ -21,6 +21,9 @@
     "full_fan_speed_layer": [
         "2"
     ],
+    "additional_fan_full_speed_layer": [
+        "2"
+    ],
     "overhang_fan_speed": [
         "40"
     ],
@@ -28,6 +31,6 @@
         "0%"
     ],
     "temperature_vitrification": [
-        "170"
+        "130"
     ]
 }

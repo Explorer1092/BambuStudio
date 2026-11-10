@@ -32,7 +32,7 @@ struct StringObjectException
     std::string string;
     ObjectBase const *object = nullptr;
     std::string opt_key;
-    StringExceptionType         type;   // warning type for tips
+    StringExceptionType         type = STRING_EXCEPT_NOT_DEFINED;   // warning type for tips
     bool is_warning = false;
     std::vector<std::string>    params; // warning params for tips
     std::string                         hypetext;
@@ -63,7 +63,9 @@ public:
         SlicingReplaceInitEmptyLayers,
         SlicingNeedSupportOn,
         SlicingEmptyGcodeLayers,
-        SlicingGcodeOverlap
+        SlicingGcodeOverlap,
+        SlicingSupportIncomplete,
+        SlicingSupportIncompleteOnBuildPlate
     };
 
     typedef size_t TimeStamp;
@@ -397,7 +399,8 @@ public:
 
     // Validate the print, return empty string if valid, return error if process() cannot (or should not) be started.
     //BBS: add more paremeters to validate
-    virtual StringObjectException validate(StringObjectException *warning = nullptr, Polygons* collison_polygons = nullptr, std::vector<std::pair<Polygon, float>>* height_polygons = nullptr) const { return {}; }
+    // Each independent warning is appended to `warnings` as its own entry, so the GUI can show them side by side.
+    virtual StringObjectException validate(std::vector<StringObjectException> *warnings = nullptr, Polygons* collison_polygons = nullptr, std::vector<std::pair<Polygon, float>>* height_polygons = nullptr) const { return {}; }
 
     enum ApplyStatus {
         // No change after the Print::apply() call.
@@ -426,7 +429,7 @@ public:
     virtual void            set_task(const TaskParams &params) {}
     // Perform the calculation. This is the only method that is to be called at a worker thread.
     virtual void            process(std::unordered_map<std::string, long long>* slice_time = nullptr, bool use_cache = false) = 0;
-    virtual int             export_cached_data(const std::string& dir_path, bool with_space=false) { return 0;}
+    virtual int             export_cached_data(const std::string& dir_path, int& obj_cnt_exported, bool with_space=false) { return 0;}
     virtual int            load_cached_data(const std::string& directory) { return 0;}
     // Clean up after process() finished, either with success, error or if canceled.
     // The adjustments on the Print / PrintObject data due to set_task() are to be reverted here.
@@ -449,6 +452,7 @@ public:
         {
         }
         int             percent { -1 };
+        bool            is_helio{false};
         std::string     text;
         // Bitmap of flags.
         enum FlagBits {
@@ -508,6 +512,8 @@ public:
 
     const PlaceholderParser&   placeholder_parser() const { return m_placeholder_parser; }
     const DynamicPrintConfig&  full_print_config() const { return m_full_print_config; }
+
+    const DynamicPrintConfig& ori_full_print_config() const { return m_ori_full_print_config; }
 
     virtual std::string        output_filename(const std::string &filename_base = std::string()) const = 0;
     // If the filename_base is set, it is used as the input for the template processing. In that case the path is expected to be the directory (may be empty).

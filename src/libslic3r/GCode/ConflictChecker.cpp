@@ -6,6 +6,7 @@
 #include <map>
 #include <functional>
 #include <atomic>
+#include "libslic3r/Log.hpp"
 
 namespace Slic3r {
 
@@ -241,8 +242,12 @@ ConflictResultOpt ConflictChecker::find_inter_of_lines_in_diff_objs(PrintObjectP
     }
     for (PrintObject *obj : objs) {
         auto layers = getAllLayersExtrusionPathsFromObject(obj);
-        conflictQueue.emplace_back_bucket(std::move(layers.perimeters), obj, obj->instances().front().shift);
-        conflictQueue.emplace_back_bucket(std::move(layers.support), obj, obj->instances().front().shift);
+        // Every instance prints these paths at its own position, so each one gets its own buckets and is told apart by
+        // its address. That also checks the instances of one object against each other.
+        for (const PrintInstance &instance : obj->instances()) {
+            conflictQueue.emplace_back_bucket(ExtrusionLayers(layers.perimeters), &instance, instance.shift);
+            conflictQueue.emplace_back_bucket(ExtrusionLayers(layers.support), &instance, instance.shift);
+        }
     }
 
     std::vector<LineWithIDs> layersLines;
@@ -275,13 +280,13 @@ ConflictResultOpt ConflictChecker::find_inter_of_lines_in_diff_objs(PrintObjectP
             const FakeWipeTower *wtdp = wtdptr.value();
             if (ptr1 == wtdp || ptr2 == wtdp) {
                 if (ptr2 == wtdp) { std::swap(ptr1, ptr2); }
-                const PrintObject *obj2 = reinterpret_cast<const PrintObject *>(ptr2);
-                return std::make_optional<ConflictResult>("WipeTower", obj2->model_object()->name, conflictPrintZ, nullptr, ptr2);
+                const PrintObject *obj2 = reinterpret_cast<const PrintInstance *>(ptr2)->print_object;
+                return std::make_optional<ConflictResult>("WipeTower", obj2->model_object()->name, conflictPrintZ, nullptr, obj2);
             }
         }
-        const PrintObject *obj1 = reinterpret_cast<const PrintObject *>(ptr1);
-        const PrintObject *obj2 = reinterpret_cast<const PrintObject *>(ptr2);
-        return std::make_optional<ConflictResult>(obj1->model_object()->name, obj2->model_object()->name, conflictPrintZ, ptr1, ptr2);
+        const PrintObject *obj1 = reinterpret_cast<const PrintInstance *>(ptr1)->print_object;
+        const PrintObject *obj2 = reinterpret_cast<const PrintInstance *>(ptr2)->print_object;
+        return std::make_optional<ConflictResult>(obj1->model_object()->name, obj2->model_object()->name, conflictPrintZ, obj1, obj2);
     } else
         return {};
 }
@@ -291,6 +296,9 @@ ConflictComputeOpt ConflictChecker::line_intersect(const LineWithID &l1, const L
     constexpr double SUPPORT_THRESHOLD = 100;  // this large almost disables conflict check of supports
     constexpr double OTHER_THRESHOLD   = 0.01;
     if (l1._id == l2._id) { return {}; } // return true if lines are from same object
+    double overlap_length = 0.;
+    bool   overlap  = l1._line.overlap(l2._line, overlap_length);
+    if (overlap && overlap_length > scaled(OTHER_THRESHOLD)) return std::make_optional<ConflictComputeResult>(l1._id, l2._id);
     Point inter;
     bool  intersect = l1._line.intersection(l2._line, &inter);
 

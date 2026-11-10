@@ -23,19 +23,19 @@ using namespace Slic3r::GUI;
 namespace Slic3r { namespace GUI {
 #define ANIMATION_REFRESH_INTERVAL 20
 BaseTransparentDPIFrame::BaseTransparentDPIFrame(
-    wxWindow *parent, int win_width, wxPoint dialog_pos, int ok_button_width, wxString win_text, wxString ok_text, wxString cancel_text, DisappearanceMode disappearance_mode)
+    wxWindow *parent, int win_width, wxPoint dialog_pos, int ok_button_width, wxString win_text, wxString ok_text, wxString cancel_text, DisappearanceMode disappearance_mode, std::string icon_name)
     : DPIFrame(static_cast<wxWindow *>(wxGetApp().mainframe), wxID_ANY, "", wxDefaultPosition, wxDefaultSize, !wxCAPTION | !wxCLOSE_BOX | wxBORDER_NONE)
     , m_timed_disappearance_mode(disappearance_mode)
 {
     // SetBackgroundStyle(wxBackgroundStyle::wxBG_STYLE_TRANSPARENT);
     SetTransparent(m_init_transparent);
     SetBackgroundColour(wxColour(23, 25, 22, 128));
-    //Adaptive Frame Width
+    // Widen the frame for a long OK label. win_width is in DIP, so measure the label in DIP with the button font.
     wxClientDC dc(parent);
-    wxSize msg_sz = dc.GetMultiLineTextExtent(ok_text);
-    auto   ratio = msg_sz.GetX() / (float) win_width;
-    if (ratio > 0.75f) {
-        win_width += msg_sz.GetX() / 2.0f;
+    dc.SetFont(Label::Body_12);
+    const int msg_width = ToDIP(dc.GetMultiLineTextExtent(ok_text).GetX());
+    if (msg_width > win_width * 0.75f) {
+        win_width += msg_width / 2;
     }
 
     SetMinSize(wxSize(FromDIP(win_width), -1));
@@ -47,7 +47,7 @@ BaseTransparentDPIFrame::BaseTransparentDPIFrame(
     text_sizer->AddSpacer(FromDIP(20));
     auto image_sizer  = new wxBoxSizer(wxVERTICAL);
     auto imgsize      = FromDIP(25);
-    auto completedimg = new wxStaticBitmap(this, wxID_ANY, create_scaled_bitmap("completed", this, 25), wxDefaultPosition, wxSize(imgsize, imgsize), 0);
+    auto completedimg = new wxStaticBitmap(this, wxID_ANY, create_scaled_bitmap(icon_name, this, 25), wxDefaultPosition, wxSize(imgsize, imgsize), 0);
     image_sizer->Add(completedimg, 0, wxALIGN_LEFT | wxALIGN_CENTER_VERTICAL | wxALL, FromDIP(0));
     image_sizer->AddStretchSpacer();
     text_sizer->Add(image_sizer);
@@ -72,7 +72,7 @@ BaseTransparentDPIFrame::BaseTransparentDPIFrame(
     m_button_ok = new Button(this, ok_text);
     m_button_ok->SetBackgroundColor(btn_bg_green);
     m_button_ok->SetBorderWidth(0);
-    m_button_ok->SetTextColor(wxColour(0xFEFEFE));
+    m_button_ok->SetTextColor(wxColour("#FEFEFE"));
     m_button_ok->SetFont(Label::Body_12);
     m_button_ok->SetSize(wxSize(FromDIP(60), FromDIP(30)));
     m_button_ok->SetMinSize(wxSize(FromDIP(90), FromDIP(30)));
@@ -85,7 +85,7 @@ BaseTransparentDPIFrame::BaseTransparentDPIFrame(
     m_button_cancel->SetBackgroundColor(btn_bg_white);
     m_button_cancel->SetBorderColor(wxColour(93, 93, 91));
     m_button_cancel->SetFont(Label::Body_12);
-    m_button_cancel->SetTextColor(wxColour(0xFEFEFE));
+    m_button_cancel->SetTextColor(wxColour("#FEFEFE"));
     m_button_cancel->SetSize(wxSize(FromDIP(65), FromDIP(30)));
     m_button_cancel->SetMinSize(wxSize(FromDIP(65), FromDIP(30)));
     m_button_cancel->SetCornerRadius(FromDIP(6));

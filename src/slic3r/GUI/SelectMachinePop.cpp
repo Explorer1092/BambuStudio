@@ -29,6 +29,7 @@
 #include "BindDialog.hpp"
 
 #include "DeviceCore/DevManager.h"
+#include "libslic3r/Log.hpp"
 
 namespace Slic3r { namespace GUI {
 
@@ -698,6 +699,8 @@ void SelectMachinePopup::update_user_devices()
                 if (mobj) {
                     mobj->set_access_code("");
                     mobj->erase_user_access_code();
+                    mobj->erase_user_access_dev_ip();
+                    wxGetApp().app_config->erase("user_access_dev_ip", mobj->get_dev_id());
                 }
 
                 if (GUI::wxGetApp().plater())
@@ -1072,7 +1075,8 @@ PinCodePanel::PinCodePanel(wxWindow* parent, int type, wxWindowID winid /*= wxID
              wxGetApp().popup_ping_bind_dialog();
          }
          else{
-             auto m_confirm_login_dlg = new SecondaryCheckDialog(nullptr, wxID_ANY, _L("Bind with Pin Code"), SecondaryCheckDialog::ButtonStyle::ONLY_CONFIRM, wxDefaultPosition);
+            auto m_confirm_login_dlg = new SecondaryCheckDialog(wxGetApp().mainframe, wxID_ANY, _L("Bind with Pin Code"), SecondaryCheckDialog::ButtonStyle::ONLY_CONFIRM,
+                                                                wxDefaultPosition);
              m_confirm_login_dlg->SetSize(wxSize(FromDIP(270), FromDIP(158)));
              m_confirm_login_dlg->update_text(_L("Please log in before binding your device with a PIN code.\nAlternatively, you can use LAN mode to bind your device. Learn about LAN mode."));
              m_confirm_login_dlg->update_btn_label(_L("Go to Login"), _L(""));

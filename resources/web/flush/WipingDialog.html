@@ -113,13 +113,28 @@
           margin: 0;
       }
 
+      /* Same colors as the native TextInput widget */
       input[type="number"].multiplier-input {
         width: 60px;
+        padding: 2px 4px;
+        border: 1px solid #dbdbdb;
+        border-radius: 4px;
+        outline: none;
+        background-color: #ffffff;
+        color: #262e30;
+      }
+      input[type="number"].multiplier-input:hover,
+      input[type="number"].multiplier-input:focus {
+        border-color: #00ae42;
       }
       body.dark-mode input[type="number"].multiplier-input {
-        width: 60px;
-        background-color: #4c4c55;
-        color: white;
+        border-color: #4a4a51;
+        background-color: #2d2d31;
+        color: #efeff0;
+      }
+      body.dark-mode input[type="number"].multiplier-input:hover,
+      body.dark-mode input[type="number"].multiplier-input:focus {
+        border-color: #21a452;
       }
 
       .warning-text {
@@ -202,6 +217,11 @@
       }
 
       /* 暗色模式样式 */
+      /* Root scheme drives native scrollbars of the page and of .scroll-container */
+      html.dark-mode {
+        color-scheme: dark;
+      }
+
       body.dark-mode {
         background-color: #2d2d31;
         color: #e0e0e0;
@@ -388,6 +408,7 @@
       let m_max_flush_volumes = []
       let m_min_flush_multiplier = 0.50
       let m_max_flush_multiplier = 3
+      let m_default_matrix //系统默认矩阵
 
       function storeData() {
         var data = JSON.stringify({
@@ -516,14 +537,19 @@
         m_raw_matrix = data.flush_volume_matrixs.map(function(arr) {
           return arr.slice();
         });
+        m_default_matrix = data.default_matrixs.map(function (arr) {
+            return arr.slice();
+        });
         m_flush_multipiers = data.flush_multiplier.slice()
         m_max_flush_volumes = data.max_flush_volumes
         m_min_flush_volumes = data.min_flush_volumes
         m_min_flush_multiplier = data.min_flush_multiplier
         m_max_flush_multiplier = data.max_flush_multiplier
 
-        if(data.is_dark_mode == true)
+        if(data.is_dark_mode == true) {
+          document.documentElement.classList.add('dark-mode');
           document.body.classList.add('dark-mode');
+        }
 
         updateFlushMultiplier(m_curr_extruder_id)
 
@@ -607,10 +633,10 @@
 
       function handleExtruderSelect(extruder) {
         m_curr_extruder_id = extruder == 'left' ? 0 : 1
-        updateTable(m_raw_matrix[m_curr_extruder_id], m_curr_extruder_id)
         updateVolumeRange(m_min_flush_volumes[m_curr_extruder_id],m_max_flush_volumes[m_curr_extruder_id])
         updateFlushMultiplier(m_min_flush_multiplier[m_curr_extruder_id],m_max_flush_multiplier[m_curr_extruder_id])
         updateFlushMultiplier(m_curr_extruder_id)
+        updateTable(m_raw_matrix[m_curr_extruder_id], m_curr_extruder_id)
       }
 
       function onMultiplierChange() {
@@ -641,6 +667,14 @@
 
 
       function updateWarningTexts() {
+        let val = parseFloat(document.getElementById("multiplierInput").value);
+        const input = document.getElementById('multiplierInput');
+        if (val !== 1.0) {
+            input.style.color = 'orange';
+        } else {
+            input.style.removeProperty('color');
+        }
+
         let hasException = false;
         for (let i = 0; i < m_number_of_filaments; i++) {
           for (let j = 0; j < m_number_of_filaments; j++) {
@@ -649,11 +683,18 @@
             let val = parseInt(input.value, 10);
             if (isNaN(val)) val = 0;
 
+            var index = i * m_number_of_filaments + j;
+            let defaultVal = rawToDislay(m_default_matrix[m_curr_extruder_id][index], m_flush_multipiers[m_curr_extruder_id])
+
             if (val < m_min_flush_volumes[m_curr_extruder_id] || val > m_max_flush_volumes[m_curr_extruder_id]) {
               input.style.color = "red";
               hasException = true;
-            } else {
-              input.style.removeProperty("color"); 
+            }
+            else if (val != defaultVal) {
+              input.style.color = "orange";
+            }
+            else {
+              input.style.removeProperty("color");
             }
           }
         }

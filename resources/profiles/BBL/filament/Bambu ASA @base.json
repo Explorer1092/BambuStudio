@@ -16,7 +16,7 @@
         "35"
     ],
     "filament_cost": [
-        "31.99"
+        "26.99"
     ],
     "filament_density": [
         "1.05"
@@ -30,14 +30,14 @@
     "filament_vendor": [
         "Bambu Lab"
     ],
+    "fins_extrude_safe_temp": [
+        "100"
+    ],
     "hot_plate_temp": [
         "100"
     ],
     "hot_plate_temp_initial_layer": [
         "100"
-    ],
-    "impact_strength_z": [
-        "4.9"
     ],
     "nozzle_temperature": [
         "270"
@@ -53,5 +53,8 @@
     ],
     "textured_plate_temp_initial_layer": [
         "100"
+    ],
+    "temperature_vitrification": [
+        "85"
     ]
 }

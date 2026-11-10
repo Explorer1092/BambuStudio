@@ -332,6 +332,8 @@ protected:
     Geometry::Transformation m_volume_transformation;
     // BBS
     Vec3d m_offset_to_assembly{ 0.0, 0.0, 0.0 };
+    // Origin mesh or vertice render flag//true mean mesh render//false mean vertice render
+    bool m_origin_mesh_or_vertice_render = true;
 
     // Shift in z required by sla supports+pad
     double        m_sla_shift_z;
@@ -428,8 +430,6 @@ public:
 	    bool                disabled : 1;
 	    // Is this object printable?
 	    bool                printable : 1;
-        // Is this object visible(in assemble view)?
-	    bool                visible : 1;
 	    // Whether or not this volume is active for rendering
 	    bool                is_active : 1;
 	    // Whether or not to use this volume when applying zoom_to_volumes()
@@ -469,6 +469,10 @@ public:
     // BBS
     mutable std::vector<GLIndexedVertexArray> mmuseg_ivas;
     mutable ObjectBase::Timestamp       mmuseg_ts;
+    // Set while the Model this volume indexes into is being rewritten (cut): composite_id then
+    // resolves to a different ModelVolume, so the MMU meshes must not be rebuilt from it. The volume
+    // keeps drawing the colors already uploaded until the next reload_scene() drops it.
+    bool                                mmuseg_detached_from_model{false};
 
     // Ranges of triangle and quad indices to be rendered.
     std::pair<size_t, size_t>   tverts_range;
@@ -591,7 +595,8 @@ public:
                         const std::vector<std::array<float, 4>>& colors,
                         Model &            model,
                         bool               with_outline = false,
-                        const std::array<float, 4> &body_color = {1.0f, 1.0f, 1.0f, 1.0f} ) const;
+                        const std::array<float, 4> &body_color = {1.0f, 1.0f, 1.0f, 1.0f},
+                        bool               disable_mmu_colors = false ) const;
 
     //BBS: add simple render function for thumbnail
     void simple_render(const std::shared_ptr<GLShaderProgram>& shader, ModelObjectPtrs& model_objects, std::vector<std::array<float, 4>>& extruder_colors,bool ban_light =false) const;
@@ -607,6 +612,12 @@ public:
     bool                is_sinking() const;
     bool                is_below_printbed() const;
     void                render_sinking_contours(const GUI::Camera &camera,Model& model);
+
+    // Origin mesh or vertice render control
+    void set_origin_mesh_render_type(bool is_mesh){
+        m_origin_mesh_or_vertice_render = is_mesh;
+    }
+    bool get_origin_mesh_or_vertice_render() {return m_origin_mesh_or_vertice_render;}
 
     // Return an estimate of the memory consumed by this class.
     size_t 				cpu_memory_used() const {
@@ -626,7 +637,8 @@ public:
                 const std::vector<std::array<float, 4>> & colors,
                 Model &                                  model,
                 bool                        with_outline = false,
-                const std::array<float, 4> & body_color  = {1.0f, 1.0f, 1.0f, 1.0f}) const override;
+                const std::array<float, 4> & body_color  = {1.0f, 1.0f, 1.0f, 1.0f},
+                bool                        disable_mmu_colors = false) const override;
 
     std::vector<GLIndexedVertexArray> iva_per_colors;
     bool                              IsTransparent();
@@ -678,6 +690,14 @@ private:
     std::array<float, 4>    m_color_clip_plane;
     bool                     m_use_color_clip_plane{false};
     std::array<ColorRGBA, 2> m_color_clip_plane_colors{ColorRGBA::RED(), ColorRGBA::BLUE()};
+    bool        m_use_dovetail_clip{false};
+    Transform3d m_dovetail_clip_matrix{Transform3d::Identity()};
+    Vec4f       m_dovetail_clip_params{Vec4f::Zero()};
+    Vec2f       m_dovetail_clip_tolerance{Vec2f::Zero()};
+
+    // Volume-based color override for gizmos (e.g., mesh boolean)
+    bool m_use_volume_color_override{false};
+    std::unordered_map<unsigned int, std::array<float, 4>> m_volume_color_overrides;
 
     struct Slope
     {
@@ -775,6 +795,9 @@ public:
 
     void release_volume (GLVolume* volume);
 
+    // Find a scene volume by its (object, volume, instance) composite id; nullptr if none matches.
+    const GLVolume* get_volume_by_composite_id(int obj_id, int vol_id, int instance_id) const;
+
     bool empty() const { return volumes.empty(); }
     void set_range(double low, double high) { for (GLVolume *vol : this->volumes) vol->set_range(low, high); }
 
@@ -799,6 +822,36 @@ public:
         m_color_clip_plane[3] = offset;
     }
     void set_color_clip_plane_colors(const std::array<ColorRGBA, 2> &colors) { m_color_clip_plane_colors = colors; }
+    void set_use_dovetail_clip(bool use) { m_use_dovetail_clip = use; }
+    void set_dovetail_clip(const Transform3d &world_to_groove, const Vec4f &params, const Vec2f &tolerance)
+    {
+        m_dovetail_clip_matrix = world_to_groove;
+        m_dovetail_clip_params = params;
+        m_dovetail_clip_tolerance = tolerance;
+    }
+
+    // Volume color override methods (similar to color_clip_plane methods)
+    void set_use_volume_color_override(bool use) { m_use_volume_color_override = use; }
+    void set_volume_color_override(unsigned int volume_idx, const std::array<float, 4>& color) {
+        m_volume_color_overrides[volume_idx] = color;
+    }
+    void set_volumes_color_override(const std::vector<unsigned int>& volume_indices, const std::array<float, 4>& color) {
+        for (unsigned int idx : volume_indices) {
+            m_volume_color_overrides[idx] = color;
+        }
+    }
+    void clear_volume_color_override(unsigned int volume_idx) {
+        m_volume_color_overrides.erase(volume_idx);
+    }
+    void clear_all_volume_color_overrides() {
+        m_volume_color_overrides.clear();
+        m_use_volume_color_override = false;
+    }
+    const std::array<float, 4>& get_volume_render_color(unsigned int volume_idx, const std::array<float, 4>& default_color) const {
+        if (!m_use_volume_color_override) return default_color;
+        auto it = m_volume_color_overrides.find(volume_idx);
+        return (it != m_volume_color_overrides.end()) ? it->second : default_color;
+    }
 
     bool is_slope_GlobalActive() const { return m_slope.isGlobalActive; }
     bool is_slope_active() const { return m_slope.active; }

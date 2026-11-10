@@ -82,8 +82,10 @@ extern void about();
 extern void login();
 // Ask the destop to open the datadir using the default file explorer.
 extern void desktop_open_datadir_folder();
+// Ask the desktop to open the application log folder using the default file explorer.
+extern void desktop_open_log_folder();
 // Ask the destop to open one folder
-extern void desktop_open_any_folder(const std::string path);
+extern void desktop_open_any_folder(const std::string& path);
 } // namespace GUI
 } // namespace Slic3r
 

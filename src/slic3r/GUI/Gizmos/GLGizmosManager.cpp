@@ -35,6 +35,8 @@
 #include "libslic3r/PresetBundle.hpp"
 
 #include <wx/glcanvas.h>
+#include <algorithm>
+#include "libslic3r/Log.hpp"
 
 namespace Slic3r {
 namespace GUI {
@@ -56,10 +58,20 @@ GLGizmosManager::GLGizmosManager(GLCanvas3D& parent)
     m_timer_set_color.Bind(wxEVT_TIMER, &GLGizmosManager::on_set_color_timer, this);
 }
 
-std::vector<size_t> GLGizmosManager::get_selectable_idxs() const
+std::vector<size_t> GLGizmosManager::get_selectable_idxs(bool ignore_selectable_include_right_click_trigger) const
 {
     std::vector<size_t> out;
     if (m_parent.get_canvas_type() == GLCanvas3D::CanvasAssembleView) {
+        // Prefer canvas-provided allow-list (AssembleView -> Move + Rotate).
+        const std::vector<int> special = m_parent.get_special_allow_gizmos();
+        if (!special.empty()) {
+            for (size_t i = 0; i < m_gizmos.size(); ++i) {
+                const int sid = static_cast<int>(m_gizmos[i]->get_sprite_id());
+                if (std::find(special.begin(), special.end(), sid) != special.end())
+                    out.push_back(i);
+            }
+            return out;
+        }
         for (size_t i = 0; i < m_gizmos.size(); ++i)
             if (m_gizmos[i]->get_sprite_id() == (unsigned int) Move ||
                 m_gizmos[i]->get_sprite_id() == (unsigned int) Rotate ||
@@ -69,9 +81,14 @@ std::vector<size_t> GLGizmosManager::get_selectable_idxs() const
                 out.push_back(i);
     }
     else {
-        for (size_t i = 0; i < m_gizmos.size(); ++i)
-            if (m_gizmos[i]->is_selectable())
+        for (size_t i = 0; i < m_gizmos.size(); ++i){
+            if (ignore_selectable_include_right_click_trigger) {
                 out.push_back(i);
+            }else{
+                if (m_gizmos[i]->is_selectable())
+                    out.push_back(i);
+            }
+        }
     }
     return out;
 }
@@ -211,6 +228,110 @@ bool GLGizmosManager::init_icon_textures()
      else
          return false;
 
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/align_x_min.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int)IC_ALIGN_X_MIN, texture_id));
+    else
+        return false;
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/align_x_min_dark.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int) IC_ALIGN_X_MIN_DARK, texture_id));
+    else
+        return false;
+
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/align_x_center.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int)IC_ALIGN_X_CENTER, texture_id));
+    else
+        return false;
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/align_x_center_dark.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int) IC_ALIGN_X_CENTER_DARK, texture_id));
+    else
+        return false;
+
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/align_x_max.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int)IC_ALIGN_X_MAX, texture_id));
+    else
+        return false;
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/align_x_max_dark.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int) IC_ALIGN_X_MAX_DARK, texture_id));
+    else
+        return false;
+
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/align_y_min.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int)IC_ALIGN_Y_MIN, texture_id));
+    else
+        return false;
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/align_y_min_dark.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int) IC_ALIGN_Y_MIN_DARK, texture_id));
+    else
+        return false;
+
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/align_y_center.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int)IC_ALIGN_Y_CENTER, texture_id));
+    else
+        return false;
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/align_y_center_dark.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int) IC_ALIGN_Y_CENTER_DARK, texture_id));
+    else
+        return false;
+
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/align_y_max.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int)IC_ALIGN_Y_MAX, texture_id));
+    else
+        return false;
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/align_y_max_dark.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int) IC_ALIGN_Y_MAX_DARK, texture_id));
+    else
+        return false;
+
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/align_z_min.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int)IC_ALIGN_Z_MIN, texture_id));
+    else
+        return false;
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/align_z_min_dark.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int) IC_ALIGN_Z_MIN_DARK, texture_id));
+    else
+        return false;
+
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/align_z_center.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int)IC_ALIGN_Z_CENTER, texture_id));
+    else
+        return false;
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/align_z_center_dark.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int) IC_ALIGN_Z_CENTER_DARK, texture_id));
+    else
+        return false;
+
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/align_z_max.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int)IC_ALIGN_Z_MAX, texture_id));
+    else
+        return false;
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/align_z_max_dark.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int) IC_ALIGN_Z_MAX_DARK, texture_id));
+    else
+        return false;
+
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/distribute_x.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int)IC_DISTRIBUTE_X, texture_id));
+    else
+        return false;
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/distribute_x_dark.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int) IC_DISTRIBUTE_X_DARK, texture_id));
+    else
+        return false;
+
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/distribute_y.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int)IC_DISTRIBUTE_Y, texture_id));
+    else
+        return false;
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/distribute_y_dark.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int) IC_DISTRIBUTE_Y_DARK, texture_id));
+    else
+        return false;
+
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + "/images/distribute_z_dark.svg", 64, 64, texture_id))
+        icon_list.insert(std::make_pair((int)IC_DISTRIBUTE_Z_DARK, texture_id));
+    else
+        return false;
+
     return true;
 }
 
@@ -272,7 +393,18 @@ bool GLGizmosManager::check_gizmos_closed_except(EType type) const
 
 void GLGizmosManager::set_hover_id(int id)
 {
-    if (m_current == EType::Measure || m_current == EType::Assembly) { return; }
+    if (m_current == EType::Measure || m_current == EType::Assembly) {
+        // Measure/Assembly manage feature hover via their own raycasters.
+        // Only forward framebuffer picking for the assembly rotate grabber (id 0).
+        // Do NOT forward -1: clearing hover here would wipe Measure's feature hover
+        // before on_render restores it and breaks selected-face persistence.
+        if (id != 0)
+            return;
+        if (!m_enabled)
+            return;
+        m_gizmos[m_current]->set_hover_id(id);
+        return;
+    }
     if (!m_enabled || m_current == Undefined)
         return;
 
@@ -312,7 +444,6 @@ void GLGizmosManager::update_data()
     }
     if (m_current != Undefined)
         m_gizmos[m_current]->data_changed(m_serializing);
-
     //BBS: GUI refactor: add object manipulation in gizmo
     if (m_current == EType::Move || m_current == EType::Rotate || m_current == EType::Scale) {
         if (!selection.is_empty()) {
@@ -345,6 +476,12 @@ bool GLGizmosManager::handle_shortcut(int key)
     });
 
     if (it == m_gizmos.end())
+        return false;
+
+    // Only allow gizmos that are visible in the current toolbar
+    size_t gizmo_idx = it - m_gizmos.begin();
+    const std::vector<size_t> selectable = get_selectable_idxs();
+    if (std::find(selectable.begin(), selectable.end(), gizmo_idx) == selectable.end())
         return false;
 
     // allowe open shortcut even when selection is empty
@@ -568,10 +705,26 @@ bool GLGizmosManager::is_paint_gizmo() const
            m_current == EType::Seam;
 }
 
+bool GLGizmosManager::is_allow_x_ray_in_assembly() const
+{
+    if (m_current == Undefined || m_current == EType::Move || m_current == EType::Rotate || m_current == EType::Scale) {
+        return true;
+    }
+    return false;
+}
+
 bool GLGizmosManager::is_allow_select_all() const {
     if (m_current == Undefined || m_current == EType::Move||
         m_current == EType::Rotate ||
         m_current == EType::Scale) {
+        return true;
+    }
+    return false;
+}
+
+bool GLGizmosManager::is_allow_multi_select_parts_or_objects() const
+{
+    if (m_current == Undefined || m_current == EType::Move || m_current == EType::Rotate || m_current == EType::Scale) {
         return true;
     }
     return false;
@@ -630,6 +783,13 @@ bool GLGizmosManager::wants_reslice_supports_on_undo() const
 
 void GLGizmosManager::on_change_color_mode(bool is_dark) {
     m_is_dark = is_dark;
+
+    // Notify all gizmos about theme change
+    for (auto& gizmo : m_gizmos) {
+        if (gizmo) {
+            gizmo->on_change_color_mode(is_dark);
+        }
+    }
 }
 
 void GLGizmosManager::render_current_gizmo() const
@@ -1040,7 +1200,7 @@ bool GLGizmosManager::on_char(wxKeyEvent& evt)
         }
     }
 
-    if (!processed && !evt.HasModifiers())
+    if (!processed && !evt.HasModifiers() && !evt.ShiftDown())//single key shortcut
     {
         if (handle_shortcut(keyCode))
             processed = true;
@@ -1259,8 +1419,6 @@ void GLGizmosManager::add_toolbar_items(const std::shared_ptr<GLToolbar>& p_tool
         return;
     }
 
-    std::vector<size_t> selectable_idxs = get_selectable_idxs();
-
     auto p_gizmo_manager = this;
     for (size_t i = 0; i < m_gizmos.size(); ++i)
     {
@@ -1304,9 +1462,12 @@ void GLGizmosManager::add_toolbar_items(const std::shared_ptr<GLToolbar>& p_tool
         item.pressed_recheck_callback = [p_gizmo_manager, t_type]()->bool {
             return p_gizmo_manager->m_current == t_type;
         };
-        const bool b_is_selectable = (std::find(selectable_idxs.begin(), selectable_idxs.end(), idx) != selectable_idxs.end());
-        item.visibility_callback = [p_gizmo_manager, idx, b_is_selectable]()->bool {
-            bool rt = b_is_selectable;
+        // Re-query selectable idxs each frame so OverallPreview's special allow-list
+        // (Move / Rotate) can show/hide without rebuilding the toolbar.
+        item.visibility_callback = [p_gizmo_manager, idx]()->bool {
+            const std::vector<size_t> selectable_idxs = p_gizmo_manager->get_selectable_idxs();
+            bool rt = std::find(selectable_idxs.begin(), selectable_idxs.end(), idx) !=
+                      selectable_idxs.end();
             if (idx == EType::Svg) {
                 rt = rt && (p_gizmo_manager->m_current == EType::Svg);
             }
@@ -1315,7 +1476,7 @@ void GLGizmosManager::add_toolbar_items(const std::shared_ptr<GLToolbar>& p_tool
             }
             return rt;
         };
-        item.visible = b_is_selectable;
+        item.visible = true;
         p_toolbar->add_item(item);
     }
 }
@@ -1459,7 +1620,12 @@ bool GLGizmosManager::activate_gizmo(EType type)
                 if (agent) { agent->track_update_property(name, std::to_string(count)); }
             }
         }
-        catch (...) {}
+        catch (...) {
+            BOOST_LOG_TRIVIAL(warning) << current_exception_message();
+        }
+    } else {
+        // Gizmo closed (type -> Undefined): restore assembly display mode when X-Ray is allowed.
+        m_parent.do_something_after_gizmo_exit();
     }
     return true;
 }
@@ -1546,6 +1712,71 @@ int GLGizmosManager::get_shortcut_key(GLGizmosManager::EType type) const
 void GLGizmosManager::set_highlight(EType gizmo, bool highlight_shown)
 {
     m_highlight = std::pair<EType, bool>(gizmo, highlight_shown);
+}
+
+// Lazy-load an icon on demand if it wasn't loaded during init_icon_textures
+void* GLGizmosManager::ensure_icon_loaded(MENU_ICON_NAME icon)
+{
+    auto it = icon_list.find((int)icon);
+    if (it != icon_list.end())
+        return it->second;
+
+    std::string path;
+    int w = 20, h = 20; // default size for most icons
+
+    switch (icon) {
+        case IC_TOOLBAR_RESET:              path = "/images/toolbar_reset.svg"; w = h = 14; break;
+        case IC_TOOLBAR_RESET_HOVER:        path = "/images/toolbar_reset_hover.svg"; w = h = 14; break;
+        case IC_TOOLBAR_RESET_ZERO:         path = "/images/toolbar_reset_zero.svg"; w = h = 14; break;
+        case IC_TOOLBAR_RESET_ZERO_HOVER:   path = "/images/toolbar_reset_zero_hover.svg"; w = h = 14; break;
+        case IC_TOOLBAR_TOOLTIP:            path = "/images/toolbar_tooltip.svg"; w = 30; h = 22; break;
+        case IC_TOOLBAR_TOOLTIP_HOVER:      path = "/images/toolbar_tooltip_hover.svg"; w = 30; h = 22; break;
+        case IC_FIT_CAMERA:                 path = "/images/fit_camera.svg"; w = h = 64; break;
+        case IC_FIT_CAMERA_HOVER:           path = "/images/fit_camera_hover.svg"; w = h = 64; break;
+        case IC_FIT_CAMERA_DARK:            path = "/images/fit_camera_dark.svg"; w = h = 64; break;
+        case IC_FIT_CAMERA_DARK_HOVER:      path = "/images/fit_camera_dark_hover.svg"; w = h = 64; break;
+        case IC_VIEW_BOTTOM:                path = "/images/view_bottom.svg"; w = h = 64; break;
+        case IC_VIEW_TOP:                   path = "/images/view_top.svg"; w = h = 64; break;
+        case IC_VIEW_FRONT:                 path = "/images/view_front.svg"; w = h = 64; break;
+        case IC_VIEW_REAR:                  path = "/images/view_rear.svg"; w = h = 64; break;
+        case IC_VIEW_LEFT:                  path = "/images/view_left.svg"; w = h = 64; break;
+        case IC_VIEW_OK:                    path = "/images/view_ok.svg"; w = h = 64; break;
+        case IC_VIEW_RIGHT:                 path = "/images/view_right.svg"; w = h = 64; break;
+        case IC_VIEW_ISO:                   path = "/images/view_iso.svg"; w = h = 64; break;
+        case IC_VIEW_HELP:                  path = "/images/view_help.svg"; w = h = 64; break;
+        case IC_VIEW_BOTTOM_DARK:           path = "/images/view_bottom_dark.svg"; w = h = 64; break;
+        case IC_VIEW_TOP_DARK:              path = "/images/view_top_dark.svg"; w = h = 64; break;
+        case IC_VIEW_FRONT_DARK:            path = "/images/view_front_dark.svg"; w = h = 64; break;
+        case IC_VIEW_REAR_DARK:             path = "/images/view_rear_dark.svg"; w = h = 64; break;
+        case IC_VIEW_LEFT_DARK:             path = "/images/view_left_dark.svg"; w = h = 64; break;
+        case IC_VIEW_RIGHT_DARK:            path = "/images/view_right_dark.svg"; w = h = 64; break;
+        case IC_VIEW_ISO_DARK:              path = "/images/view_iso_dark.svg"; w = h = 64; break;
+        case IC_TEXT_B:                     path = "/images/text_B.svg"; w = h = 20; break;
+        case IC_TEXT_B_DARK:                path = "/images/text_B_dark.svg"; w = h = 20; break;
+        case IC_TEXT_T:                     path = "/images/text_T.svg"; w = h = 20; break;
+        case IC_TEXT_T_DARK:                path = "/images/text_T_dark.svg"; w = h = 20; break;
+        case IC_ALIGN_X_MIN:                path = "/images/align_x_min.svg"; w = h = 32; break;
+        case IC_ALIGN_X_CENTER:             path = "/images/align_x_center.svg"; w = h = 32; break;
+        case IC_ALIGN_X_MAX:                path = "/images/align_x_max.svg"; w = h = 32; break;
+        case IC_ALIGN_Y_MIN:                path = "/images/align_y_min.svg"; w = h = 32; break;
+        case IC_ALIGN_Y_CENTER:             path = "/images/align_y_center.svg"; w = h = 32; break;
+        case IC_ALIGN_Y_MAX:                path = "/images/align_y_max.svg"; w = h = 32; break;
+        case IC_ALIGN_Z_MIN:                path = "/images/align_z_min.svg"; w = h = 32; break;
+        case IC_ALIGN_Z_CENTER:             path = "/images/align_z_center.svg"; w = h = 32; break;
+        case IC_ALIGN_Z_MAX:                path = "/images/align_z_max.svg"; w = h = 32; break;
+        case IC_DISTRIBUTE_X:               path = "/images/distribute_x.svg"; w = h = 32; break;
+        case IC_DISTRIBUTE_Y:               path = "/images/distribute_y.svg"; w = h = 32; break;
+        case IC_DISTRIBUTE_Z:               path = "/images/distribute_z.svg"; w = h = 32; break;
+        case IC_NAME_COUNT:                 default: return nullptr;
+    }
+
+    ImTextureID texture_id;
+    if (IMTexture::load_from_svg_file(Slic3r::resources_dir() + path, w, h, texture_id)) {
+        icon_list[(int)icon] = texture_id;
+        return texture_id;
+    }
+
+    return nullptr;
 }
 
 } // namespace GUI

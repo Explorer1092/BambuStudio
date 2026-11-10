@@ -1,6 +1,7 @@
 #include "PrinterFileSystem.h"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
+#include "libslic3r/Format/ResourcePathUtils.hpp"
 #include "libslic3r/Model.hpp"
 #include "slic3r/GUI/I18N.hpp"
 
@@ -9,7 +10,6 @@
 
 #include <boost/algorithm/hex.hpp>
 #include <boost/endian/conversion.hpp>
-#include <boost/log/trivial.hpp>
 #include <boost/uuid/detail/md5.hpp>
 #include <boost/regex.hpp>
 
@@ -18,6 +18,7 @@
 #include "nlohmann/json.hpp"
 
 #include <cstring>
+#include "libslic3r/Log.hpp"
 
 #ifndef NDEBUG
 //#define PRINTER_FILE_SYSTEM_TEST
@@ -31,6 +32,14 @@ std::string last_system_error() {
         errno,
 #endif
         std::system_category()).message().c_str());
+}
+
+static std::string safe_download_path(std::string const &dir, std::string const &name)
+{
+    std::string leaf = Slic3r::resource_path::filename_from_portable_path(name).string();
+    if (leaf.empty() || leaf == "." || leaf == "..")
+        leaf = "download";
+    return (boost::filesystem::path(dir) / leaf).string();
 }
 
 wxDEFINE_EVENT(EVT_STATUS_CHANGED, wxCommandEvent);
@@ -122,11 +131,14 @@ void PrinterFileSystem::SetFileType(FileType type, std::string const &storage)
 {
     if (m_file_type == type && m_file_storage == storage)
         return;
+    bool storage_only_changed = (m_file_type == type && m_file_storage != storage);
     SelectAll(false);
     assert(m_file_list_cache[std::make_pair(m_file_type, m_file_storage)].empty());
     m_file_list.swap(m_file_list_cache[{m_file_type, m_file_storage}]);
     std::swap(m_file_type, type);
     m_file_storage = storage;
+    if (storage_only_changed)
+        m_file_list_cache[{m_file_type, m_file_storage}].clear();
     m_file_list.swap(m_file_list_cache[{m_file_type, m_file_storage}]);
     m_lock_start = m_lock_end = 0;
     BuildGroups();
@@ -428,7 +440,7 @@ void PrinterFileSystem::DownloadFiles(size_t index, std::string const &path)
             file.flags |= FF_DOWNLOAD;
             std::shared_ptr<Download> download(new Download);
             download->progress = -1;
-            download->local_path = (boost::filesystem::path(path) / file.name).string();
+            download->local_path = safe_download_path(path, file.name);
             file.download = download;
             ++n;
         }
@@ -442,7 +454,7 @@ void PrinterFileSystem::DownloadFiles(size_t index, std::string const &path)
         file.flags |= FF_DOWNLOAD;
         std::shared_ptr<Download> download(new Download);
         download->progress   = -1;
-        download->local_path = (boost::filesystem::path(path) / file.name).string();
+        download->local_path = safe_download_path(path, file.name);
         file.download        = download;
     }
     boost::filesystem::create_directories(path);
@@ -459,7 +471,7 @@ void PrinterFileSystem::DownloadCheckFiles(std::string const &path)
     for (size_t i = 0; i < m_file_list.size(); ++i) {
         auto &file = m_file_list[i];
         if ((file.flags & FF_DOWNLOAD) != 0 && file.download) continue;
-        auto path2 = boost::filesystem::path(path) / file.name;
+        boost::filesystem::path path2 = safe_download_path(path, file.name);
         boost::system::error_code ec;
         if (boost::filesystem::file_size(path2, ec) == file.size) {
             file.flags |= FF_DOWNLOAD;
@@ -509,6 +521,7 @@ void PrinterFileSystem::FetchModel(size_t index, std::function<void(int, std::st
     arr.push_back(file.path + "#Metadata/model_settings.config");
     arr.push_back(file.path + "#Metadata/slice_info.config");
     arr.push_back(file.path + "#Metadata/project_settings.config");
+    arr.push_back(file.path + "#Metadata/filament_sequence.json");// Optional part: only written by newer Studio versions
     for (auto & meta : file.metadata) {
         if (boost::algorithm::starts_with(meta.first, "plate_thumbnail_"))
             arr.push_back(file.path + "#" + meta.second);
@@ -994,6 +1007,8 @@ void PrinterFileSystem::UpdateFocusThumbnail2(std::shared_ptr<std::vector<File>>
 {
     json req;
     json arr;
+    if (!m_file_storage.empty())
+        req["storage"] = m_file_storage;
     if (type == OldThumbnail) {
         for (auto &file : *files) arr.push_back(file.name);
         req["files"] = arr;
@@ -1510,7 +1525,7 @@ void PrinterFileSystem::CancelRequests2(std::vector<boost::uint32_t> const &seqs
     l.unlock();
     for (auto &c : callbacks) {
 #if !BBL_RELEASE_TO_PUBLIC
-        BOOST_LOG_TRIVIAL(info) << "PrinterFileSystem::CancelRequests2:" << c.first;
+        BOOST_LOG_TRIVIAL(info) << c.first;
 #endif
         c.second(ERROR_CANCEL, json(), nullptr);
     }
@@ -1618,7 +1633,7 @@ void PrinterFileSystem::HandleResponse(boost::unique_lock<boost::mutex> &l, Bamb
     // OutputDebugStringA("\n");
 
 #if !BBL_RELEASE_TO_PUBLIC
-    BOOST_LOG_TRIVIAL(info) << "PrinterFileSystem::HandleResponse <<<: \n" << wxString::FromUTF8(msg);
+    BOOST_LOG_TRIVIAL(info) << "<<<: \n" << wxString::FromUTF8(msg);
 #endif
 
     std::istringstream iss(msg);
@@ -1639,6 +1654,7 @@ void PrinterFileSystem::HandleResponse(boost::unique_lock<boost::mutex> &l, Bamb
             resp = root["notify"];
         }
     } catch (...) {
+        BOOST_LOG_TRIVIAL(warning) << Slic3r::current_exception_message();
         result = ERROR_JSON;
         return;
     }
@@ -1686,7 +1702,7 @@ void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int resul
     if (m_session.tunnel) {
         auto tunnel = m_session.tunnel;
         m_session.tunnel = nullptr;
-        BOOST_LOG_TRIVIAL(info) << "PrinterFileSystem::Reconnect close " << result;
+        BOOST_LOG_TRIVIAL(info) << "close " << result;
         l.unlock();
         Bambu_Close(tunnel);
         Bambu_Destroy(tunnel);
@@ -1714,7 +1730,7 @@ void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int resul
            SendChangedEvent(EVT_STATUS_CHANGED, m_status);
            m_cond.wait(l);
         }
-        BOOST_LOG_TRIVIAL(info) << "PrinterFileSystem::Reconnect Initializing";
+        BOOST_LOG_TRIVIAL(info) << "Initializing";
         m_status = Status::Initializing;
         m_last_error = 0;
         SendChangedEvent(EVT_STATUS_CHANGED, m_status);
@@ -1725,15 +1741,15 @@ void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int resul
         std::string url = m_messages.front();
         m_messages.clear();
         if (url.size() < 2) {
-            BOOST_LOG_TRIVIAL(info) << "PrinterFileSystem::Reconnect Initialize failed:";
+            BOOST_LOG_TRIVIAL(info) << "Initialize failed:";
             m_last_error = atoi(url.c_str());
             if (m_last_error == 0)
                 m_stopped = true;
         } else {
-            BOOST_LOG_TRIVIAL(info) << "PrinterFileSystem::Reconnect Initialized:" ;
+            BOOST_LOG_TRIVIAL(info) << "Initialized:" ;
             l.unlock();
             m_status = Status::Connecting;
-            BOOST_LOG_TRIVIAL(info) << "PrinterFileSystem::Reconnect Connecting";
+            BOOST_LOG_TRIVIAL(info) << "Connecting";
             SendChangedEvent(EVT_STATUS_CHANGED, m_status);
             Bambu_Tunnel tunnel = nullptr;
             int ret = Bambu_Create(&tunnel, url.c_str());
@@ -1763,11 +1779,13 @@ void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int resul
             l.lock();
             if (ret == 0) {
                 m_session.tunnel = tunnel;
-                BOOST_LOG_TRIVIAL(info) << "PrinterFileSystem::Reconnect Connected";
+                BOOST_LOG_TRIVIAL(info) << "Connected";
                 break;
             } else if (ret == 1) {
                 m_stopped = true;
                 ret = ERROR_RES_BUSY;
+            } else if (ret == Bambu_would_block) {
+                ret = ERROR_TIME_OUT;
             }
             if (tunnel) {
                 Bambu_Close(tunnel);
@@ -1775,7 +1793,7 @@ void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int resul
             }
             m_last_error = ret;
         }
-        BOOST_LOG_TRIVIAL(info) << "PrinterFileSystem::Reconnect Failed";
+        BOOST_LOG_TRIVIAL(info) << "Failed";
         m_status = Status::Failed;
 
         SendChangedEvent(EVT_STATUS_CHANGED, m_status, "", url.size() < 2 ? 1 : m_last_error);
@@ -1822,7 +1840,7 @@ static void* get_function(const char* name)
 
     if (!function) {
 #if !BBL_RELEASE_TO_PUBLIC
-        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(", can not find function %1%") % name;
+        BOOST_LOG_TRIVIAL(warning) << boost::format("can not find function %1%") % name;
 #endif
     }
     return function;
@@ -1843,7 +1861,7 @@ StaticBambuLib &StaticBambuLib::get(BambuLib *copy)
     }
 
     if (!module) {
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ", can not Load Library";
+        BOOST_LOG_TRIVIAL(info) << "can not Load Library";
     }
 
     GET_FUNC(Bambu_Create);
@@ -1857,6 +1875,9 @@ StaticBambuLib &StaticBambuLib::get(BambuLib *copy)
     GET_FUNC(Bambu_Close);
     GET_FUNC(Bambu_Destroy);
     GET_FUNC(Bambu_SetLogger);
+    GET_FUNC(Bambu_SetStreamInfoCallback);
+    GET_FUNC(Bambu_SetTrackReporter);
+    GET_FUNC(Bambu_GetSessionStat);
     GET_FUNC(Bambu_FreeLogMsg);
     GET_FUNC(Bambu_Deinit);
 

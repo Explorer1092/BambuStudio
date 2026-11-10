@@ -14,6 +14,9 @@
 #include <wx/animate.h>
 #include <wx/dynarray.h>
 #include "../DeviceCore/DevFan.h"
+#include "../DeviceCore/DevAirPurifier.hpp"
+
+class ComboBox; // defined at global scope in ComboBox.hpp
 
 namespace Slic3r {
 namespace GUI {
@@ -24,9 +27,9 @@ Description:Fan
 **************************************************/
 #define SIZE_OF_FAN_OPERATE wxSize(154, 28)
 
-#define DRAW_TEXT_COLOUR wxColour(0x898989)
-#define DRAW_HEAD_TEXT_COLOUR wxColour(0x262e30)
-#define DRAW_OPERATE_LINE_COLOUR wxColour(0xDEDEDE)
+#define DRAW_TEXT_COLOUR wxColour("#898989")
+#define DRAW_HEAD_TEXT_COLOUR wxColour("#262e30")
+#define DRAW_OPERATE_LINE_COLOUR wxColour("#DEDEDE")
 
 enum FanControlType
 {
@@ -178,6 +181,35 @@ public:
     void msw_rescale();
 };
 
+/*************************************************
+Description:AirPurifierControl
+    A card in the fan panel showing air purifier(APS):
+    name + real-time pm value + gear dropdown (Auto/Strong/Standard/Quiet/Off).
+**************************************************/
+class AirPurifierControl : public wxWindow
+{
+public:
+    AirPurifierControl(wxWindow *parent, wxWindowID id = wxID_ANY, const wxPoint &pos = wxDefaultPosition, const wxSize &size = wxDefaultSize);
+    ~AirPurifierControl() {};
+
+    void set_machine_obj(MachineObject *obj) { m_obj = obj; }
+    void set_air_purifier_data(int pm, int gear);
+    void msw_rescale();
+
+private:
+    void on_gear_changed(wxCommandEvent &evt);
+    int  gear_to_index(int gear) const;
+
+    MachineObject  *m_obj{nullptr};
+    ScalableBitmap *m_bitmap_fan{nullptr};
+    wxStaticText   *m_static_name{nullptr};
+    wxStaticText   *m_static_pm{nullptr};
+    ComboBox       *m_combo_gear{nullptr};
+
+    int m_cur_gear{-1};
+    int m_set_time_out{0};// suppress polling jitter right after a command
+};
+
 wxDECLARE_EVENT(EVT_FANCTRL_SWITCH, wxCommandEvent);
 class FanControlNewSwitchPanel : public wxWindow
 {
@@ -230,6 +262,9 @@ private:
     // The fan operates
     std::map<int, FanControlNew*> m_fan_control_list; //<duct_id, <fan_id, FanControl>>
 
+    // Air purifier(APS) card, shown when APS is in place
+    AirPurifierControl* m_air_purifier_ctrl{ nullptr };
+
     // The object
     MachineObject *m_obj{nullptr};
     AirDuctData    m_data;
@@ -242,12 +277,14 @@ private:
 
 private:
     void  init_names(MachineObject* obj);
+    wxString get_fan_mode_name(int mode_id) const;
     wxString get_fan_func_name(int mode, int submode, AIR_FUN func) const;
 
     void  CreateDuct();
           
     void  UpdateParts();
     void  UpdatePartSubMode();
+    void  UpdateAirPurifier(MachineObject* obj);// APS card, independent of AirDuctData
           
     void  update_fan_data(const AirDuctData& data);
     void  update_fan_data(AIR_FUN id, int speed);

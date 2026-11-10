@@ -13,7 +13,10 @@
 
 // https://github.com/AngusJohnson/Clipper2/discussions/334
 // #discussioncomment-4248602
-#if defined(_MSC_VER) && ( defined(_M_AMD64) || defined(_M_X64) )
+// ARM64EC defines _M_X64 but _mm_cvtsd_si64 has neither a native EC lowering
+// nor a softintrin fallback; the standard C functions compile to native ARM64
+// rounding/min/max instructions there anyway.
+#if defined(_MSC_VER) && ( defined(_M_AMD64) || defined(_M_X64) ) && !defined(_M_ARM64EC)
 #include <xmmintrin.h>
 #include <emmintrin.h>
 #define fmin(a,b) _mm_cvtsd_f64(_mm_min_sd(_mm_set_sd(a),_mm_set_sd(b)))
@@ -21,12 +24,16 @@
 #define nearbyint(a) _mm_cvtsd_si64(_mm_set_sd(a)) /* Note: expression type is (int64_t) */
 #endif
 
+#ifdef USINGZ
+namespace Clipper2Lib_Z {
+#else
 namespace Clipper2Lib {
+#endif
 
   static const Rect64 invalid_rect = Rect64(false);
 
-  // Every closed path (ie polygon) is made up of a series of vertices forming edge 
-  // 'bounds' that alternate between ascending bounds (containing edges going up 
+  // Every closed path (ie polygon) is made up of a series of vertices forming edge
+  // 'bounds' that alternate between ascending bounds (containing edges going up
   // relative to the Y-axis) and descending bounds. 'Local Minima' refers to
   // vertices where ascending and descending bounds join at the bottom, and
   // 'Local Maxima' are where ascending and descending bounds join at the top.
@@ -1801,14 +1808,14 @@ namespace Clipper2Lib {
 
       switch (fillrule_)
       {
-      case FillRule::Positive: 
-        if (edge_c->wind_cnt != 1) return; 
+      case FillRule::Positive:
+        if (edge_c->wind_cnt != 1) return;
         break;
-      case FillRule::Negative: 
-        if (edge_c->wind_cnt != -1) return; 
+      case FillRule::Negative:
+        if (edge_c->wind_cnt != -1) return;
         break;
-      default: 
-        if (std::abs(edge_c->wind_cnt) != 1) return; 
+      default:
+        if (std::abs(edge_c->wind_cnt) != 1) return;
       }
 
 #ifdef USINGZ
@@ -1929,7 +1936,7 @@ namespace Clipper2Lib {
     const bool e1_windcnt_in_01 = old_e1_windcnt == 0 || old_e1_windcnt == 1;
     const bool e2_windcnt_in_01 = old_e2_windcnt == 0 || old_e2_windcnt == 1;
 
-    if ((!IsHotEdge(e1) && !e1_windcnt_in_01) || 
+    if ((!IsHotEdge(e1) && !e1_windcnt_in_01) ||
       (!IsHotEdge(e2) && !e2_windcnt_in_01))
         return;
 

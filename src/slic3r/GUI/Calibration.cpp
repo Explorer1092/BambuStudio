@@ -7,11 +7,13 @@
 #include "GUI_App.hpp"
 #include "GUI_Preview.hpp"
 #include "MainFrame.hpp"
+#include "ReleaseNote.hpp"
 #include "format.hpp"
 #include "Widgets/RoundedRectangle.hpp"
 #include "Widgets/StaticBox.hpp"
 
 #include "DeviceCore/DevConfig.h"
+#include "libslic3r/Log.hpp"
 
 static wxColour FG_COLOR = wxColour(0x32, 0x3A, 0x3D);
 static wxColour BG_COLOR = wxColour(0xF8, 0xF8, 0xF8);
@@ -52,12 +54,13 @@ CalibrationDialog::CalibrationDialog(Plater *plater)
     cali_step_select_title->SetBackgroundColour(BG_COLOR);
     cali_left_sizer->Add(cali_step_select_title, 0, wxLEFT, FromDIP(15));
 
-    select_xcam_cali    = create_check_option(_L("Micro lidar calibration"), cali_left_panel, _L("Micro lidar calibration"), "xcam_cali");
-    select_bed_leveling = create_check_option(_L("Bed leveling"),            cali_left_panel, _L("Bed leveling"),                       "bed_leveling");
-    select_vibration    = create_check_option(_L("Vibration compensation"), cali_left_panel, _L("Vibration compensation"), "vibration");
-    select_motor_noise  = create_check_option(_L("Motor noise cancellation"), cali_left_panel, _L("Motor noise cancellation"), "motor_noise");
-    select_nozzle_cali  = create_check_option(_L("Nozzle offset calibration"), cali_left_panel, _L("Nozzle offset calibration"), "nozzle_cali");
-    select_heatbed_cali = create_check_option(_L("High-temperature Heatbed Calibration"), cali_left_panel, _L("High-temperature Heatbed Calibration"), "bed_cali");
+    select_xcam_cali     = create_check_option(_L("Micro Lidar Calibration"), cali_left_panel, _L("Micro Lidar Calibration"), "xcam_cali");
+    select_bed_leveling  = create_check_option(_L("Auto Bed Leveling"), cali_left_panel, _L("Auto Bed Leveling"), "bed_leveling");
+    select_vibration     = create_check_option(_L("Vibration Compensation"), cali_left_panel, _L("Vibration Compensation"), "vibration");
+    select_motor_noise   = create_check_option(_L("Motor Noise Cancellation"), cali_left_panel, _L("Motor Noise Cancellation"), "motor_noise");
+    select_nozzle_cali   = create_check_option(_L("Nozzle Offset Calibration"), cali_left_panel, _L("Nozzle Offset Calibration"), "nozzle_cali");
+    select_heatbed_cali  = create_check_option(_L("High-temperature Bed Leveling"), cali_left_panel, _L("High-temperature Bed Leveling"), "bed_cali");
+    select_clumppos_cali = create_check_option(_L("Nozzle Clumping Detection Calibration"), cali_left_panel, _L("Nozzle Clumping Detection Calibration"), "clump_pos_cali");
 
     // STUDIO-10091 the default not checked option
     if(m_checkbox_list.count("bed_cali") != 0)
@@ -72,6 +75,7 @@ CalibrationDialog::CalibrationDialog(Plater *plater)
     cali_left_sizer->Add(select_motor_noise, 0, wxLEFT, FromDIP(15));
     cali_left_sizer->Add(select_nozzle_cali, 0, wxLEFT, FromDIP(15));
     cali_left_sizer->Add(select_heatbed_cali, 0, wxLEFT, FromDIP(15));
+    cali_left_sizer->Add(select_clumppos_cali, 0, wxLEFT, FromDIP(15));
     cali_left_sizer->Add(0, FromDIP(30), 0, wxEXPAND, 0);
 
     auto cali_left_text_top = new wxStaticText(cali_left_panel, wxID_ANY, _L("Calibration program"), wxDefaultPosition, wxDefaultSize, 0);
@@ -120,7 +124,7 @@ CalibrationDialog::CalibrationDialog(Plater *plater)
     wxBoxSizer *cali_right_sizer_h = new wxBoxSizer(wxHORIZONTAL);
     wxBoxSizer *cali_right_sizer_v = new wxBoxSizer(wxVERTICAL);
 
-    auto cali_right_panel = new StaticBox(body_panel, wxID_ANY, wxDefaultPosition, wxSize(FromDIP(182), FromDIP(200)));
+    auto cali_right_panel = new StaticBox(body_panel, wxID_ANY, wxDefaultPosition, wxSize(FromDIP(182), -1));
     cali_right_panel->SetBackgroundColor(BG_COLOR);
     cali_right_panel->SetBorderColor(BG_COLOR);
 
@@ -254,6 +258,13 @@ void CalibrationDialog::update_cali(MachineObject *obj)
         m_checkbox_list["bed_cali"]->SetValue(false);
     }
 
+    if (obj->GetConfig()->SupportCaliClumpPos()) {
+        select_clumppos_cali->Show();
+    } else {
+        select_clumppos_cali->Hide();
+        m_checkbox_list["clump_pos_cali"]->SetValue(false);
+    }
+
     if (obj->is_calibration_running() || obj->is_calibration_done()) {
         if (obj->is_calibration_done()) {
             m_calibration_btn->Enable();
@@ -273,7 +284,7 @@ void CalibrationDialog::update_cali(MachineObject *obj)
             m_calibration_flow->Refresh();
 
             Layout();
-
+            Fit();
         }
         if (is_stage_list_info_changed(obj)) {
             // change items if stage_list_info changed
@@ -281,6 +292,8 @@ void CalibrationDialog::update_cali(MachineObject *obj)
             for (int i = 0; i < obj->stage_list_info.size(); i++) {
                 m_calibration_flow->AppendItem(Slic3r::get_stage_string(obj->stage_list_info[i]));
             }
+
+            last_stage_list_info = obj->stage_list_info;
         }
         int index = obj->get_curr_stage_idx();
         m_calibration_flow->SelectItem(index);
@@ -292,11 +305,15 @@ void CalibrationDialog::update_cali(MachineObject *obj)
         else {
             m_calibration_btn->Enable();
         }
+
         m_calibration_flow->DeleteAllItems();
+        last_stage_list_info = obj->stage_list_info;
+
         m_calibration_btn->SetLabel(_L("Start Calibration"));
         if (!m_checkbox_list["vibration"]->GetValue() && !m_checkbox_list["bed_leveling"]->GetValue() &&
             !m_checkbox_list["xcam_cali"]->GetValue() && !m_checkbox_list["motor_noise"]->GetValue() &&
-            !m_checkbox_list["nozzle_cali"]->GetValue() && !m_checkbox_list["bed_cali"]->GetValue())
+            !m_checkbox_list["nozzle_cali"]->GetValue() && !m_checkbox_list["bed_cali"]->GetValue() &&
+            !m_checkbox_list["clump_pos_cali"]->GetValue())
         {
             m_calibration_btn->Disable();
             m_calibration_btn->SetLabel(_L("No step selected"));
@@ -305,6 +322,8 @@ void CalibrationDialog::update_cali(MachineObject *obj)
             m_calibration_btn->Enable();
         }
     }
+
+
 }
 
 bool CalibrationDialog::is_stage_list_info_changed(MachineObject *obj)
@@ -328,14 +347,56 @@ void CalibrationDialog::on_start_calibration(wxMouseEvent &event)
             EndModal(wxID_CANCEL);
             Close();
         } else {
-            BOOST_LOG_TRIVIAL(info) << "on_start_calibration";
+            if (m_obj->GetConfig() && m_obj->GetConfig()->SupportCalibrationHighTempBedUnloadTips() &&
+                m_checkbox_list["bed_cali"]->GetValue()) {
+                if (m_obj->is_filament_installed()) {
+                    bool start_anyway = false;
+                    bool unload_filament = false;
+
+                    ConfirmBeforeSendDialog confirm_dlg(this, wxID_ANY, _L("Tips"));
+                    confirm_dlg.edit_ok_button_txt(_L("Start Anyway"), true);
+                    confirm_dlg.edit_cancel_button_txt(_L("Unload"), true);
+                    confirm_dlg.update_text(_L("You have selected High-temperature Bed Leveling. To prevent filament from softening in the extruder, please unload the filament before calibration."));
+                    confirm_dlg.Bind(EVT_SECONDARY_CHECK_CONFIRM, [&start_anyway](wxCommandEvent&) {
+                        start_anyway = true;
+                    });
+                    confirm_dlg.Bind(EVT_SECONDARY_CHECK_CANCEL, [&unload_filament](wxCommandEvent&) {
+                        unload_filament = true;
+                    });
+                    confirm_dlg.on_show();
+
+                    if (unload_filament) {
+                        if (m_obj->is_enable_np) {
+                            if (m_obj->GetExtderSystem()) {
+                                for (const auto& ext : m_obj->GetExtderSystem()->GetExtruders()) {
+                                    if (ext.HasFilamentInExt()) {
+                                        m_obj->command_ams_change_filament(false, ext.GetSlotNow().ams_id, "255");
+                                    }
+                                }
+                            }
+                        } else {
+                            std::string curr_ams_id = m_obj->GetExtderSystem() ? m_obj->GetExtderSystem()->GetCurrentAmsId() : "255";
+                            m_obj->command_ams_change_filament(false, curr_ams_id, "255");
+                        }
+                        EndModal(wxID_CANCEL);
+                        Close();
+                        return;
+                    }
+                    if (!start_anyway) {
+                        return;
+                    }
+                }
+            }
+
+            BOOST_LOG_TRIVIAL(info);
             m_obj->command_start_calibration(
                 m_checkbox_list["vibration"]->GetValue(),
                 m_checkbox_list["bed_leveling"]->GetValue(),
                 m_checkbox_list["xcam_cali"]->GetValue(),
                 m_checkbox_list["motor_noise"]->GetValue(),
                 m_checkbox_list["nozzle_cali"]->GetValue(),
-                m_checkbox_list["bed_cali"]->GetValue()
+                m_checkbox_list["bed_cali"]->GetValue(),
+                m_checkbox_list["clump_pos_cali"]->GetValue()
                 );
         }
     }

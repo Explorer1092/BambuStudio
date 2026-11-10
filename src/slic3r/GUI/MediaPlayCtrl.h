@@ -24,16 +24,32 @@
 
 #include <chrono>
 #include <deque>
+#include <functional>
 #include <set>
+#include <memory>
+#include <vector>
+#include <cstddef>
+#include <string>
+#include <atomic>
 
 class Button;
 class Label;
 
+wxDECLARE_EVENT(EVT_MEDIA_FULLSCREEN, wxCommandEvent);
+
 namespace Slic3r {
 
 class MachineObject;
+class FileTransferObject;
 
 namespace GUI {
+
+// Camera types for liveview
+enum class LiveviewCameraType {
+    CAMERA_OLD_VERSION = -1, // For old version which does not have camera info, treat it as valid
+    CAMERA_MAIN = 4,     // Main camera
+    CAMERA_DEPUTY = 5    // Deputy camera
+};
 
 class MediaPlayCtrl : public wxPanel
 {
@@ -52,6 +68,15 @@ public:
 
     void jump_to_play();
 
+    static bool is_valid_camera(int camera_id);
+
+    static bool is_support_switch_cam(const std::vector<int>& support_liveview_cams);
+
+    void RequestFileSystemUrl(std::function<void(std::string url)> cb, bool lan_mode=true);
+
+    using ImageResultCb = std::function<void(int ec, int resp_ec, std::string json, std::vector<std::byte> data)>;
+    void SetDeviceImageUrl(std::string url);
+
 protected:
     void onStateChanged(wxMediaEvent & event);
 
@@ -66,6 +91,10 @@ protected:
 private:
     void load();
 
+    void update_camera_switch_tooltip();
+
+    void start_device_image_flow();
+
     void on_show_hide(wxShowEvent & evt);
 
     void media_proc();
@@ -75,16 +104,21 @@ private:
     static bool get_stream_url(std::string *url = nullptr);
 
 private:
-    static constexpr wxMediaState MEDIASTATE_IDLE = (wxMediaState) 3;
-    static constexpr wxMediaState MEDIASTATE_INITIALIZING = (wxMediaState) 4;
-    static constexpr wxMediaState MEDIASTATE_LOADING = (wxMediaState) 5;
-    static constexpr wxMediaState MEDIASTATE_BUFFERING = (wxMediaState) 6;
+    static const wxMediaState MEDIASTATE_IDLE = (wxMediaState) 3;
+    // The states below extend wxMediaState beyond its declared range [0, 3].
+    // Converting an out-of-range integer to the enum is ill-formed in a constant
+    // expression (a hard error on Clang / Xcode 26+ that no -Wno- flag can silence),
+    // so these must not be constexpr/const - keep them as runtime-initialized values.
+    static inline wxMediaState MEDIASTATE_INITIALIZING = (wxMediaState) 4;
+    static inline wxMediaState MEDIASTATE_LOADING = (wxMediaState) 5;
+    static inline wxMediaState MEDIASTATE_BUFFERING = (wxMediaState) 6;
 
     // token
     std::shared_ptr<int> m_token = std::make_shared<int>(0);
 
     wxMediaCtrl3 * m_media_ctrl;
     wxMediaState m_last_state = MEDIASTATE_IDLE;
+    MachineObject* m_obj = nullptr;
     std::string m_machine;
     int m_lan_proto = 0;
     std::string m_lan_ip;
@@ -93,6 +127,7 @@ private:
     std::string m_dev_ver;
     std::string m_tutk_state;
     bool m_camera_exists = false;
+    bool m_support_liveview_preview = false;
     bool m_lan_mode = false;
     int m_remote_proto = 0;
     bool m_device_busy = false;
@@ -115,10 +150,26 @@ private:
     std::chrono::system_clock::time_point m_play_timer;
     int           m_print_idle = 0;
     int           m_load_duration = 0;
+    std::string   m_pending_start_liveview_json;
+
+    // session-end tracking
+    bool    m_session_connect_success     = false;
+    bool    m_session_first_frame_success = false;
+    int     m_session_first_frame_cost_ms = 0;
+
+    std::shared_ptr<int> m_image_token = std::make_shared<int>(0);
+    std::chrono::steady_clock::time_point m_image_last_success_time;
+    std::string m_image_last_machine;
 
     ::Button *m_button_play;
+    ::Button *m_button_camera_switch;
+    ::Button *m_button_fullscreen;
     ::Label * m_label_stat;
     ::Label * m_label_status;
+
+    std::shared_ptr<FileTransferObject> m_image_transfer;
+
+    int m_last_camera = -2;  // Track last camera value to avoid redundant tooltip updates
 };
 
 }}

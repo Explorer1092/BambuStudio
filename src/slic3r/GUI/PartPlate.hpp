@@ -6,17 +6,18 @@
 #include <array>
 #include <thread>
 #include <mutex>
+#include <memory>
 
 #include "libslic3r/ObjectID.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/Slicing.hpp"
 #include "libslic3r/Arrange.hpp"
-#include "Plater.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/PrintConfig.hpp"
-#include "GLCanvas3D.hpp"
+// VendorProfile::PrinterModel is a nested type, so it cannot be forward declared.
+#include "libslic3r/Preset.hpp"
 #include "GLTexture.hpp"
 #include "3DScene.hpp"
 #include "GLModel.hpp"
@@ -49,21 +50,29 @@ inline int compute_colum_count(int count)
 }
 
 
-extern const float WIPE_TOWER_DEFAULT_X_POS;
-extern const float WIPE_TOWER_DEFAULT_Y_POS;  // Max y
-
-extern const float I3_WIPE_TOWER_DEFAULT_X_POS;
-extern const float I3_WIPE_TOWER_DEFAULT_Y_POS; // Max y
-
-
-
 namespace Slic3r {
+
+std::pair<float, float> get_wipe_tower_default_pos(const DynamicPrintConfig &config, int plate_width, int plate_depth);
+
+namespace GUI { class PartPlate; }
+
+arrangement::ArrangePolygon init_clamped_wipe_tower_pos(
+    DynamicPrintConfig &config,
+    const GUI::PartPlate *plate,
+    int plate_index,
+    int plate_width,
+    int plate_depth,
+    int extruder_count,
+    int plate_extruder_count,
+    bool legacy_behavior = false);
 
 class Model;
 class ModelObject;
 class ModelInstance;
 class Print;
 class SLAPrint;
+class BackgroundSlicingProcess;
+struct HelioPlateResult;
 
 namespace GUI {
 class Plater;
@@ -102,8 +111,17 @@ private:
     bool m_locked;
     bool m_ready_for_slice;
     bool m_slice_result_valid;
+    // 切片结果被置为无效的次数。故意不参与下面 load()/save()：它只能往前走，
+    // undo/redo 恢复了 m_slice_result_valid 也不该让它倒回去
+    size_t m_slice_invalid_epoch {0};
     bool m_apply_invalid {false};
     bool m_helio_apply_invalid {false};
+    // BBS: whether this plate's wipe tower has already been placed once. Survives
+    // undo/redo (included in load()/save() below) but deliberately not written to 3mf.
+    bool m_wipe_tower_placed {false};
+    Vec3d m_wipe_tower_last_est_size {Vec3d::Zero()}; // not serialized; size change detector
+    bool  m_wipe_tower_last_wrapping {false};         // not serialized; paired with m_wipe_tower_last_est_size
+    std::unique_ptr<HelioPlateResult> m_helio_result;
     float m_slice_percent;
 
     Print *m_print; //Print reference, not own it, no need to serialize
@@ -120,6 +138,8 @@ private:
     Pointfs m_raw_shape;
     Pointfs m_shape;
     Pointfs m_exclude_area;
+    Pointfs m_heat_soak_area;
+    int     m_heat_soak_toolpath_level{0};
     std::vector<Pointfs> m_extruder_areas;
     std::vector<double> m_extruder_heights;
     BoundingBoxf3 m_bounding_box;
@@ -134,7 +154,6 @@ private:
     GLModel        m_height_limit_bottom;
     GLModel        m_height_limit_top;
     GLModel        m_plate_name_edit_icon;
-
     float m_scale_factor{ 1.0f };
     GLUquadricObject* m_quadric;
     int m_hover_id;
@@ -152,14 +171,14 @@ private:
     GLTexture            m_name_texture;
 
     void init();
-    bool valid_instance(int obj_id, int instance_id);
+    bool valid_instance(int obj_id, int instance_id) const;
     void generate_exclude_polygon(ExPolygon &exclude_polygon);
     void generate_logo_polygon(ExPolygon &logo_polygon);
     void generate_logo_polygon(ExPolygon &logo_polygon,const BoundingBoxf3& box);
     void calc_bounding_boxes() const;
     void calc_height_limit();
 
-    int get_right_icon_offset_bed();
+    int get_right_icon_offset_bed(int i = 0);//such as delete and lock icons
     void calc_vertex_for_plate_name(GLTexture &texture, GLModel &buffer);
     void calc_vertex_for_plate_name_edit_icon(GLTexture *texture, int index, GLModel &buffer);
     bool calc_bed_3d_boundingbox(BoundingBoxf3 & box_in_plate_origin);
@@ -175,8 +194,10 @@ private:
     void render_right_arrow(const float* render_color, bool use_lighting) const;
 
     void render_icon_texture(GLModel &buffer, GLTexture &texture);
+    void show_tooltip(const std::string tooltip);
     void render_plate_name_texture();
-    void render_icons(bool bottom, bool only_body = false, int hover_id = -1);
+    void render_icons(bool bottom, bool only_body = false, int hover_id = -1,bool render_name_edit_icon = true);
+    void render_plate_name_icon_and_texture(bool only_body = false, int hover_id = -1);
 
     void render_numbers(bool bottom);
     void on_render_for_picking();
@@ -187,8 +208,8 @@ private:
 
 public:
     static const unsigned int PLATE_BASE_ID = 255 * 255 * 253;
-    static const unsigned int PLATE_FILAMENT_MAP_ID = 6;
-    static const unsigned int GRABBER_COUNT = 8;
+    static const unsigned int GRABBER_COUNT         = 8;
+    static const unsigned int PLATE_FILAMENT_MAP_ID = GRABBER_COUNT - 2;
     static const unsigned int PLATE_NAME_ID = GRABBER_COUNT-1;
 
     static std::array<float, 4> SELECT_COLOR;
@@ -232,16 +253,29 @@ public:
 
     std::vector<int> get_real_filament_maps(const DynamicConfig& g_config, bool* use_global_param = nullptr)const;
     FilamentMapMode  get_real_filament_map_mode(const DynamicConfig& g_config,bool * use_global_param = nullptr) const;
+    std::vector<int> get_real_filament_volume_maps(const DynamicConfig &g_config, bool *use_global_param = nullptr) const;
 
     FilamentMapMode get_filament_map_mode() const;
     void set_filament_map_mode(const FilamentMapMode& mode);
+
+    // Check if the printer has different extruder types
+    static bool has_different_extruder_types();
 
     // get filament map, 0 based filament ids, 1 based extruder ids
     std::vector<int> get_filament_maps() const;
     void set_filament_maps(const std::vector<int>& f_maps);
 
+    std::vector<int> get_filament_nozzle_maps() const;
+    void set_filament_nozzle_maps(const std::vector<int>& f_maps);
+
+    std::vector<int> get_filament_volume_maps() const;
+    void set_filament_volume_maps(const std::vector<int>& f_maps);
+
     void clear_filament_map();
     void clear_filament_map_mode();
+    void reset_default_filament_map_mode(const ConfigBase* printer_config);
+    void clear_filament_nozzle_map();
+    void clear_filament_volume_map();
 
     bool has_spiral_mode_config() const;
     bool get_spiral_vase_mode() const;
@@ -251,6 +285,7 @@ public:
     //static const double plate_x_gap = 0.2;
     ThumbnailData thumbnail_data;
     ThumbnailData no_light_thumbnail_data;
+    ThumbnailData obj_preview_origin_thumbnail_data;
     ThumbnailData obj_preview_thumbnail_data;
     static const int plate_thumbnail_width = 512;
     static const int plate_thumbnail_height = 512;
@@ -293,6 +328,8 @@ public:
 
     //get the plate's center point origin
     Vec3d get_center_origin();
+    //get the plate's top-left corner origin
+    Vec3d get_topleft_origin();
     /* size and position related functions*/
     //set position and size
     void set_pos_and_size(Vec3d& origin, int width, int depth, int height, bool with_instance_move, bool do_clear = true);
@@ -306,10 +343,17 @@ public:
     ModelInstance* get_instance(int obj_id, int instance_id);
     BoundingBoxf3 get_objects_bounding_box();
 
-    Vec3d get_origin() { return m_origin; }
+    Vec3d get_origin() const { return m_origin; }
     //Vec3d calculate_wipe_tower_size(const DynamicPrintConfig &config, const double w, const double wipe_volume, int plate_extruder_size = 0, bool use_global_objects = false) const;
-    Vec3d estimate_wipe_tower_size(const DynamicPrintConfig & config, const double w, const double wipe_volume, int extruder_count = 1, int plate_extruder_size = 0, bool use_global_objects = false, bool enable_wrapping_detection = false) const;
-    arrangement::ArrangePolygon estimate_wipe_tower_polygon(const DynamicPrintConfig & config, int plate_index, Vec3d& wt_pos, Vec3d& wt_size, int extruder_count = 1, int plate_extruder_size = 0, bool use_global_objects = false) const;
+    // legacy_behavior: restore the old estimate/placement logic, used only by CLI call
+    // sites so headless output stays unchanged while GUI gets the newer logic.
+    Vec3d estimate_wipe_tower_size(const DynamicPrintConfig & config, const double w, const double wipe_volume, int extruder_count = 1, int plate_extruder_size = 0, bool use_global_objects = false, bool enable_wrapping_detection = false, bool legacy_behavior = false) const;
+    arrangement::ArrangePolygon estimate_wipe_tower_polygon(const DynamicPrintConfig & config, int plate_index, Vec3d& wt_pos, Vec3d& wt_size, int extruder_count = 1, int plate_extruder_size = 0, bool use_global_objects = false, bool legacy_behavior = false) const;
+
+    // "Optimal" first position for this plate's wipe tower: hugs the parts' inflated hull
+    // toward the printer's native default direction, then clears forbidden regions. Only
+    // the tower moves. out_pos is plate-local. Returns false if no usable position is found.
+    bool compute_optimal_wipe_tower_pos(const DynamicPrintConfig &config, const Vec3d &wt_size, Vec2d &out_pos) const;
     bool check_objects_empty_and_gcode3mf(std::vector<int> &result) const;
     // get used filaments from config, 1 based idx
     std::vector<int> get_extruders(bool conside_custom_gcode = false) const;
@@ -317,12 +361,24 @@ public:
     std::vector<int> get_extruders_without_support(bool conside_custom_gcode = false) const;
     // get used filaments from gcode result, 1 based idx
     std::vector<int> get_used_filaments();
+    int  get_logical_extruder_by_filament_id(const DynamicConfig& g_config, int idx) const;
     int  get_physical_extruder_by_filament_id(const DynamicConfig& g_config, int idx) const;
+    int  get_physical_extruder_by_logical_extruder(const DynamicConfig& g_config, int logical_extruder) const;
     bool check_filament_printable(const DynamicPrintConfig & config, wxString& error_message);
+    // True when a used 2.85mm/TPU285 filament is present but the printer preset has no TPU285 nozzle.
+    bool check_missing_tpu285_nozzle(const DynamicPrintConfig &config) const;
     bool check_tpu_printable_status(const DynamicPrintConfig & config, const std::vector<int> &tpu_filaments);
     bool check_mixture_of_pla_and_petg(const DynamicPrintConfig & config);
+    bool check_multi_filament_without_prime_tower(const DynamicPrintConfig &config);
     bool check_mixture_filament_compatible(const DynamicPrintConfig& config, std::string &error_msg);
     bool check_compatible_of_nozzle_and_filament(const DynamicPrintConfig & config, const std::vector<std::string>& filament_presets, std::string& error_msg);
+    bool check_flow_compatible_of_nozzle_and_filament(const DynamicPrintConfig & config, const std::vector<std::string>& filament_presets, std::string& error_msg);
+    bool check_tpu_nozzle_has_multiple_filaments(const DynamicPrintConfig &config, std::string &error_msg);
+    bool check_high_temp_need_wrapping_detection(const DynamicPrintConfig &config, std::string &warning_text) const;
+    // Returns true when the plate uses any brittle carbon-fiber filament (PPS-CF / PPA-CF).
+    bool check_brittle_filament(const DynamicPrintConfig &config) const;
+    bool check_high_shrinkage_filament(const DynamicPrintConfig &config, std::string &filament_names) const;
+    bool check_single_extruder_mixed_filament_risk(const DynamicPrintConfig &config, std::string &warning_text) const;
 
     /* instance related operations*/
     //judge whether instance is bound in plate or not
@@ -376,6 +432,10 @@ public:
     /*rendering related functions*/
     const Pointfs& get_shape() const { return m_shape; }
     bool set_shape(const Pointfs& shape, const Pointfs& exclude_areas, const std::vector<Pointfs>& extruder_areas, const std::vector<double>& extruder_heights, Vec2d position, float height_to_lid, float height_to_rod);
+    void set_heat_soak_areas(const Pointfs& heat_soak_areas, Vec2d position);
+    // Highest heat-soak prompt level among instances and sliced toolpaths: 0 / 1 / 2.
+    int  get_heat_soak_level() const;
+    void update_toolpath_heat_soak_level(const GCodeProcessorResult& gcode_result);
     const std::vector<Pointfs>& get_extruder_areas() const { return m_extruder_areas; }
     const std::vector<double>& get_extruder_heights() const { return m_extruder_heights; }
     bool contains(const Vec3d& point) const;
@@ -390,9 +450,9 @@ public:
     const BoundingBoxf3& get_bounding_box(bool extended = false) { return extended ? m_extended_bounding_box : m_bounding_box; }
     const BoundingBox get_bounding_box_crd();
     BoundingBoxf3 get_plate_box() {return get_build_volume();}
-    BoundingBoxf3 get_build_volume(bool use_share = false);
+    BoundingBoxf3 get_build_volume(bool use_share = false) const;
 
-    const std::vector<BoundingBoxf3>& get_exclude_areas() { return m_exclude_bounding_box; }
+    const std::vector<BoundingBoxf3>& get_exclude_areas() const { return m_exclude_bounding_box; }
 
 
     /*status related functions*/
@@ -402,6 +462,15 @@ public:
     //is locked or not
     bool is_locked() const { return m_locked; }
     void lock(bool state) { m_locked = state; }
+
+    // Has this plate's wipe tower already been placed once? Resets to false only when the
+    // plate object itself is freshly constructed (new plate, delete_plate(), or 3mf reload).
+    bool is_wipe_tower_placed() const { return m_wipe_tower_placed; }
+    void set_wipe_tower_placed(bool state) { m_wipe_tower_placed = state; }
+    const Vec3d &get_wipe_tower_last_est_size() const { return m_wipe_tower_last_est_size; }
+    void set_wipe_tower_last_est_size(const Vec3d &size) { m_wipe_tower_last_est_size = size; }
+    bool get_wipe_tower_last_wrapping() const { return m_wipe_tower_last_wrapping; }
+    void set_wipe_tower_last_wrapping(bool on) { m_wipe_tower_last_wrapping = on; }
 
     //is a printable plate or not
     bool is_printable() const { return m_printable; }
@@ -421,6 +490,11 @@ public:
         m_ready_for_slice = ready_slice;
     }
 
+    //does plate contain object partly outside plate
+    bool has_outside_object() {
+        return !instance_outside_set.empty();
+    }
+
     //bedtype mismatch or not
     bool is_apply_result_invalid() const
     {
@@ -438,20 +512,33 @@ public:
         m_helio_apply_invalid = invalid;
     }
 
+    // Helio result per-plate storage
+    const HelioPlateResult* get_helio_result() const;
+    void set_helio_result(const HelioPlateResult& result);
+    void clear_helio_result();
+    bool has_helio_result() const;
+
     //is slice result valid or not
     bool is_slice_result_valid() const
     {
         return m_slice_result_valid;
     }
 
+    // 用来判断两个时刻之间有没有发生过"切片结果被置无效"
+    size_t get_slice_invalid_epoch() const
+    {
+        return m_slice_invalid_epoch;
+    }
+
     //is slice result ready for print
     bool is_slice_result_ready_for_print() const
     {
         bool result = m_slice_result_valid;
+        int  WARNING_BIT = (1<<11);
         if (result)
-            result = m_gcode_result ?
-            (!m_gcode_result->toolpath_outside && m_gcode_result->gcode_check_result.error_code == 0 && !m_gcode_result->filament_printable_reuslt.has_value()) :
-            false;// && !m_gcode_result->conflict_result.has_value()  gcode conflict can also print
+            result = m_gcode_result ? (!m_gcode_result->toolpath_outside && (m_gcode_result->gcode_check_result.error_code & ~WARNING_BIT) == 0 &&
+                                       !m_gcode_result->filament_printable_reuslt.has_value()) :
+                                      false; // && !m_gcode_result->conflict_result.has_value()  gcode conflict can also print
         return result;
     }
 
@@ -519,7 +606,7 @@ public:
         std::vector<std::pair<int, int>>	objects_and_instances;
         std::vector<std::pair<int, int>>	instances_outside;
 
-        ar(m_plate_index, m_print_index, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_name);
+        ar(m_plate_index, m_print_index, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_name, m_wipe_tower_placed);
 
         for (std::vector<std::pair<int, int>>::iterator it = objects_and_instances.begin(); it != objects_and_instances.end(); ++it)
             obj_to_instance_set.insert(std::pair(it->first, it->second));
@@ -537,7 +624,7 @@ public:
         for (std::set<std::pair<int, int>>::iterator it = obj_to_instance_set.begin(); it != obj_to_instance_set.end(); ++it)
             objects_and_instances.emplace_back(it->first, it->second);
 
-        ar(m_plate_index, m_print_index, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable,m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_name);
+        ar(m_plate_index, m_print_index, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable,m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_name, m_wipe_tower_placed);
     }
     /*template<class Archive> void serialize(Archive& ar)
     {
@@ -576,6 +663,7 @@ class PartPlateList : public ObjectBase
     Pointfs m_shape;
     Pointfs m_exclude_areas;
     Pointfs m_wrapping_exclude_areas;
+    Pointfs m_heat_soak_areas;
     std::vector<Pointfs> m_extruder_areas;
     std::vector<double> m_extruder_heights;
     BoundingBoxf3 m_bounding_box;
@@ -584,6 +672,7 @@ class PartPlateList : public ObjectBase
     GLTexture m_logo_texture;
     GLTexture m_del_texture;
     GLTexture m_del_hovered_texture;
+    GLTexture m_del_ban_texture;
     GLTexture m_arrange_texture;
     GLTexture m_arrange_hovered_texture;
     GLTexture m_orient_texture;
@@ -610,6 +699,7 @@ class PartPlateList : public ObjectBase
 
     int m_filament_count = 1;
 
+    ThumbnailData m_thumbnail_assembly_view_data;
     void init();
     //compute the origin for printable plate with index i
     Vec3d compute_origin(int index, int column_count);
@@ -631,6 +721,8 @@ private:
     void  calc_triangles(const ExPolygon &poly);
     void  calc_vertex_for_icons(int index, GLModel &gl_model);
     void  calc_exclude_triangles(const ExPolygon &poly);
+    void  calc_heat_soak_lines();
+    void  apply_heat_soak_to_plates();
     void  calc_triangles_from_polygon(const ExPolygon &poly, GLModel& render_model);
     void  calc_gridlines(const ExPolygon &poly, const BoundingBox &pp_bbox);
     void  calc_vertex_for_number(int index, bool one_number, GLModel &gl_model);
@@ -649,6 +741,9 @@ private:
     GLModel                               m_triangles;
     GLModel                               m_exclude_triangles;
     GLModel                               m_wrapping_detection_triangles;
+    GLModel                               m_heat_soak_inner_lines;
+    GLModel                               m_heat_soak_outer_lines;
+    bool                                  m_heat_soak_visible{false};
     GLModel                               m_gridlines;
     GLModel                               m_gridlines_bolder;
     GLModel                               m_del_icon;
@@ -697,6 +792,16 @@ public:
                 this->vbo_id    = part.vbo_id;
             }
 
+            void  update_pos(float xx, float yy, float ww, float hh){
+                x        = xx;
+                y        = yy;
+                w        = ww;
+                h        = hh;
+            }
+            void update_file(std::string file) {
+                filename = file;
+            }
+
             void update_buffer();
             void reset();
         private:
@@ -704,6 +809,24 @@ public:
         };
         std::vector<TexturePart> parts;
         void                     reset();
+
+        // Resolve SVG + position for double-extruder bottom texture parts.
+        // Priority:
+        //   1) bind_name  -> "<left_bottom_base>_<bind>.svg", pos prefers longer then rect
+        //   2) end_name   -> "<bottom_base>_<end>.svg" at bottom_rect
+        //   3) longer rect / bottom_rect -> update_pos only
+        // left_bottom_base / bottom_base are filenames without ".svg".
+        // bed_type + longer_ignore_list: skip bottom_rect_longer when bed type is listed.
+        static void apply_bottom_texture(
+            TexturePart &               part,
+            const std::string &         left_bottom_base,
+            const std::string &         bottom_base,
+            const std::string &         bind_name,
+            const std::string &         bottom_texture_end_name,
+            const std::array<float, 4> &bottom_rect,
+            const std::array<float, 4> &bottom_rect_longer,
+            BedType                     bed_type,
+            const std::vector<std::string> &longer_ignore_list);
     };
 
     static const unsigned int MAX_PLATES_COUNT = MAX_PLATE_COUNT;
@@ -739,7 +862,8 @@ public:
         depth = m_plate_depth;
         height = m_plate_height;
     }
-
+    // Pantheon: update plates after moving plate to the front
+    void update_plates();
     /*basic plate operations*/
     //create an empty plate and return its index
     int create_plate(bool adjust_position = true);
@@ -773,6 +897,12 @@ public:
     int get_curr_plate_index() const { return m_current_plate; }
     PartPlate* get_curr_plate() { return m_plate_list[m_current_plate]; }
     const PartPlate *get_curr_plate() const { return m_plate_list[m_current_plate]; }
+    // Accessor for the virtual (unprintable) plate used to park off-bed instances.
+    PartPlate&       get_unprintable_plate() { return unprintable_plate; }
+    const PartPlate& get_unprintable_plate() const { return unprintable_plate; }
+    ThumbnailData &get_thumbnail_assembly_view_data() { return m_thumbnail_assembly_view_data; }
+    const ThumbnailData &get_thumbnail_assembly_view_data() const { return m_thumbnail_assembly_view_data; }
+    void reset_thumbnail_assembly_view_data() { m_thumbnail_assembly_view_data.reset(); }
 
     std::vector<PartPlate*>& get_plate_list() { return m_plate_list; };
 
@@ -781,7 +911,16 @@ public:
     std::vector<PartPlate*> get_nonempty_plate_list();
 
     std::vector<const GCodeProcessorResult*> get_nonempty_plates_slice_results();
-    void set_default_wipe_tower_pos_for_plate(int plate_idx, bool init_pos = false);
+    // keep_existing=true keeps the saved wipe_tower_x/y[plate_idx] and only clamps
+    // it back when it falls outside the current plate. Used after loading 3mf to
+    // preserve valid user-adjusted positions while sanitising values whose original
+    // plate size differs from the active one (e.g. STUDIO-15720: 256x256 project
+    // reopened on A1 mini 180x180).
+    void set_default_wipe_tower_pos_for_plate(int plate_idx, bool init_pos = false, bool keep_existing = false);
+
+    // The active printer's native default wipe tower position (plate-local, min corner),
+    // before any clamping or forbidden-region avoidance.
+    Vec2d get_machine_default_wipe_tower_pos() const;
 
     //compute the origin for printable plate with index i
     Vec3d get_current_plate_origin() { return compute_origin(m_current_plate, m_plate_cols); }
@@ -874,6 +1013,7 @@ public:
     void render_grid(bool bottom);
     void render_wrapping_detection_area(bool force_default_color);
     void render_exclude_area(bool force_default_color);
+    void render_heat_soak_area(bool force_default_color);
     void render_instance_exclude_area(bool force_default_color);
     void render_unselected_exclude_area(bool force_default_color);
 
@@ -895,6 +1035,11 @@ public:
                     const std::string          &custom_texture,
                     float                       height_to_lid,
                     float                       height_to_rod);
+    void set_heat_soak_areas(const Pointfs &heat_soak_areas);
+    // Pure query: highest heat-soak prompt level on the current plate (0 / 1 / 2).
+    int  get_cur_plate_soak_level() const;
+    void set_heat_soak_visible(bool visible);
+    bool is_heat_soak_visible() const;
     void set_hover_id(int id);
     void reset_hover_id();
     bool intersects(const BoundingBoxf3 &bb);
@@ -954,9 +1099,9 @@ public:
         int h;
     };
     bool calc_extruder_only_area(Rect &left_only_rect, Rect &right_only_rect);
-    void init_bed_type_info();
+    void init_bed_type_info(const VendorProfile::PrinterModel *printer_model = nullptr, int current_extruder_count = 0);
     bool init_extruder_only_area_info();
-    void load_bedtype_textures();
+    void load_bedtype_textures(const VendorProfile::PrinterModel *printer_model = nullptr, int current_extruder_count = 0);
     void load_extruder_only_area_textures();
 
     void show_cali_texture(bool show = true);

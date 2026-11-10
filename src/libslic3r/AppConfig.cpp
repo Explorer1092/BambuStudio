@@ -1,5 +1,6 @@
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Utils.hpp"
+#include "libslic3r/MultiNozzleUtils.hpp"
 #include "AppConfig.hpp"
 //BBS
 #include "Preset.hpp"
@@ -21,10 +22,10 @@
 #include <boost/property_tree/ptree_fwd.hpp>
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/format/format_fwd.hpp>
-#include <boost/log/trivial.hpp>
 #include <boost/uuid/uuid.hpp>
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
+#include "libslic3r/Log.hpp"
 
 #ifdef WIN32
 //FIXME replace the two following includes with <boost/md5.hpp> after it becomes mainstream.
@@ -133,6 +134,8 @@ void AppConfig::set_defaults()
             set_bool("single_instance", false);
         if (get("import_3mf_as_project").empty())
             set_bool("import_3mf_as_project", true);
+        if (get("show_bed_heat_soak_area").empty())
+            set_bool("show_bed_heat_soak_area", true);
 #ifdef SUPPORT_REMEMBER_OUTPUT_PATH
         if (get("remember_output_path").empty())
             set_bool("remember_output_path", true);
@@ -166,10 +169,8 @@ void AppConfig::set_defaults()
         set_bool("use_free_camera", false);
 #endif
 
-#ifdef SUPPORT_REVERSE_MOUSE_ZOOM
     if (get("reverse_mouse_wheel_zoom").empty())
         set_bool("reverse_mouse_wheel_zoom", false);
-#endif
     if (get("enable_append_color_by_sync_ams").empty())
         set_bool("enable_append_color_by_sync_ams", true);
     if (get("enable_merge_color_by_sync_ams").empty())
@@ -179,17 +180,32 @@ void AppConfig::set_defaults()
     if (get("enable_sidebar_floatable").empty())
         set_bool("enable_sidebar_floatable", false);
 
+#if !BBL_RELEASE_TO_PUBLIC
+    if (get("timelapse_memory_test").empty())
+        set_bool("timelapse_memory_test", false);
+#endif
+
     if (get("export_sources_full_pathnames").empty())
         set_bool("export_sources_full_pathnames", false);
 
     if (get("zoom_to_mouse").empty())
-        set_bool("zoom_to_mouse", false);
+        set_bool("zoom_to_mouse", true);
+    if (get("canvas_drag_to_move").empty())
+        set_bool("canvas_drag_to_move", true);
     if (get("show_shells_in_preview").empty())
         set_bool("show_shells_in_preview", true);
     if (get("enable_text_styles").empty())
         set_bool("enable_text_styles", false);
+    if (get("use_last_fold_state_gcodeview_option_panel").empty())
+        set_bool("use_last_fold_state_gcodeview_option_panel", true);
     if (get("enable_lod").empty())
         set_bool("enable_lod", true);
+    if (get("enable_assemble_view_preview").empty())
+        set("enable_assemble_view_preview", "Auto");
+    if (get("enable_bvh").empty())
+        set_bool("enable_bvh", true);
+    if (get("show_assembly_bvh_bounds").empty())
+        set_bool("show_assembly_bvh_bounds", false);
     if (get("gamma_correct_in_import_obj").empty())
         set_bool("gamma_correct_in_import_obj", false);
     if (get("enable_opengl_multi_instance").empty())
@@ -200,6 +216,12 @@ void AppConfig::set_defaults()
         set_bool("user_bed_type", true);
     if (get("grabber_size_factor").empty())
         set("grabber_size_factor", "1.0");
+    if (get("assembly_part_number_label_font_size").empty())
+        set("assembly_part_number_label_font_size", "0");
+    if (get("3d_middle_tooltip_offset_x").empty())
+        set("3d_middle_tooltip_offset_x", "0.0");
+    if (get("3d_middle_tooltip_offset_y").empty())
+        set("3d_middle_tooltip_offset_y", "0.0");
     if (get("cancel_glmultidraw").empty())
         set_bool("cancel_glmultidraw", false);
 //#ifdef SUPPORT_SHOW_HINTS
@@ -213,6 +235,14 @@ void AppConfig::set_defaults()
     if (get("enable_multi_machine").empty())
         set_bool("enable_multi_machine", false);
 
+    if (get("studio_enable_fila_manager").empty()) {
+#ifdef __APPLE__
+        set_bool("studio_enable_fila_manager", false);
+#else
+        set_bool("studio_enable_fila_manager", true);
+#endif
+    }
+
     if (get("enable_record_gcodeviewer_option_item").empty())
         set_bool("enable_record_gcodeviewer_option_item", false);
     if (get("prefer_to_use_dgpu").empty())
@@ -223,6 +253,9 @@ void AppConfig::set_defaults()
 
     if (get("enable_advanced_antialiasing").empty())
         set_bool("enable_advanced_antialiasing", false);
+
+    if (get("enable_advanced_gcode_viewer_").empty())
+        set_bool("enable_advanced_gcode_viewer_", true);
 
     if (get("gizmo_keep_screen_size").empty())
         set_bool("gizmo_keep_screen_size", true);
@@ -267,6 +300,15 @@ void AppConfig::set_defaults()
     if (get("internal_developer_mode").empty())
         set_bool("internal_developer_mode", false);
 
+    if (get("texture_import_color_tolerance").empty())
+        set("texture_import_color_tolerance", "5");
+
+    if (get("enable_webview_devtools").empty())
+        set_bool("enable_webview_devtools", false);
+
+    if (get("disable_auto_flow_cali_tips").empty())
+        set_bool("disable_auto_flow_cali_tips", false);
+
     // BBS
     if (get("preset_folder").empty())
         set("preset_folder", "");
@@ -297,8 +339,16 @@ void AppConfig::set_defaults()
         set("auto_calculate_flush","all");
     }
 
-    if (get("enable_high_low_temp_mixed_printing").empty()){
-        set_bool("enable_high_low_temp_mixed_printing", false);
+    if (get("auto_optimize_wipe_tower_placement").empty()) {
+        set_bool("auto_optimize_wipe_tower_placement", true);
+    }
+
+    if (get("disable_fins_extrude_safe_temp").empty()){
+        set_bool("disable_fins_extrude_safe_temp", false);
+    }
+
+    if (get("camera_fullscreen_active_monitor_only").empty()){
+        set_bool("camera_fullscreen_active_monitor_only", true);
     }
 
     if (get("ignore_ext_filament_in_filament_map").empty()){
@@ -444,6 +494,9 @@ void AppConfig::set_defaults()
     if (get("enable_step_mesh_setting").empty()) {
         set_bool("enable_step_mesh_setting", true);
     }
+    if (get("enable_beta_version_update").empty()) {
+        set_bool("enable_beta_version_update", true);
+    }
     if (get("linear_defletion").empty()) {
         set("linear_defletion", "0.003");
     }
@@ -453,8 +506,22 @@ void AppConfig::set_defaults()
     if (get("is_split_compound").empty()) {
         set_bool("is_split_compound", false);
     }
-    if (get("play_slicing_video").empty()) {
-        set_bool("play_slicing_video", true);
+    // Dual-extruder first-slice guide: per printer_model (H2D / H2D Pro / H2C); migrate legacy global play_slicing_video.
+    {
+        static const char* dual_extruder_slice_guide_models[] = { "Bambu Lab H2D", "Bambu Lab H2D Pro", "Bambu Lab H2C" };
+        const std::string  legacy_sv                            = get("play_slicing_video");
+        for (const char* model : dual_extruder_slice_guide_models) {
+            const std::string k = dual_extruder_first_slice_video_app_config_key(model);
+            if (get(k).empty()) {
+                if (!legacy_sv.empty())
+                    set(k, legacy_sv);
+                else
+                    set_bool(k, true);
+            }
+        }
+    }
+    if (get("show_fila_switch_tips").empty()) {
+        set_bool("show_fila_switch_tips", true);
     }
     if (get("play_tpu_printing_video").empty()) {
         set_bool("play_tpu_printing_video", true);
@@ -462,9 +529,23 @@ void AppConfig::set_defaults()
     if (get("show_wrapping_detect_dialog").empty()) {
         set_bool("show_wrapping_detect_dialog", true);
     }
+    if (get("show_support_recommend_dialog").empty()) {
+        set_bool("show_support_recommend_dialog", true);
+    }
+    if (get("ignore_module_cert").empty()) {
+        set_bool("ignore_module_cert", false);
+    }
+    if (get("webview_auto_fill").empty()) {
+        set_bool("webview_auto_fill", true);
+    }
+    erase("app", "item_webview_auto_fill");
 
     if (get("prompt_for_brittle_filaments").empty()){
         set_bool("prompt_for_brittle_filaments", true);
+    }
+
+    if (get("use_12h_time_format").empty()) {
+        set_bool("use_12h_time_format", false);
     }
 
     // Remove legacy window positions/sizes
@@ -540,7 +621,7 @@ std::string AppConfig::load()
         auto path = AppConfig::loading_path();
         ifs.open(path);
         if (!ifs.is_open()) {
-            BOOST_LOG_TRIVIAL(info) << "AppConfig::load() open fail:" << AppConfig::loading_path();
+            BOOST_LOG_TRIVIAL(info) << "open fail:" << PathSanitizer::sanitize(path);
             return "Line break format may be incorrect.";
         }
 #ifdef WIN32
@@ -548,7 +629,7 @@ std::string AppConfig::load()
         input_stream << ifs.rdbuf();
         std::string total_string = input_stream.str();
         if (total_string.empty()) {
-            BOOST_LOG_TRIVIAL(info) << "AppConfig::load() read fail:" << AppConfig::loading_path();
+            BOOST_LOG_TRIVIAL(info) << "read fail:" << PathSanitizer::sanitize(path);
             return "read fail.";
         } else {
             size_t      last_pos    = total_string.find_last_of('}');
@@ -559,7 +640,7 @@ std::string AppConfig::load()
             std::string md5_str = appconfig_md5_hash_line({left_string.data()});
             // Verify the checksum of the config file without taking just for debugging purpose.
             if (md5_str != right_string) {
-                BOOST_LOG_TRIVIAL(info) << "The configuration file " << AppConfig::loading_path()
+                BOOST_LOG_TRIVIAL(info) << "The configuration file " << PathSanitizer::sanitize(path)
                                         << " has a wrong MD5 checksum or the checksum is missing. This may indicate a file corruption or a harmless user edit.";
             }
             j = json::parse(left_string);
@@ -663,10 +744,20 @@ std::string AppConfig::load()
                         for (auto cali_it = calis_j["presets"].begin(); cali_it != calis_j["presets"].end(); cali_it++) {
                             CaliPresetInfo preset_info;
                             preset_info.tray_id     = cali_it.value()["tray_id"].get<int>();
+                            preset_info.nozzle_diameter = cali_it.value()["nozzle_diameter"].get<float>();
+                            preset_info.filament_id     = cali_it.value()["filament_id"].get<std::string>();
+                            preset_info.setting_id      = cali_it.value()["setting_id"].get<std::string>();
+                            preset_info.name            = cali_it.value()["name"].get<std::string>();
                             if (cali_it.value().contains("extruder_id"))
                                 preset_info.extruder_id = cali_it.value()["extruder_id"].get<int>();
                             if (cali_it.value().contains("nozzle_volume_type"))
                                 preset_info.nozzle_volume_type  = NozzleVolumeType(cali_it.value()["nozzle_volume_type"].get<int>());
+                            if (cali_it.value().contains("bed_type"))
+                                preset_info.bed_type = BedType(cali_it.value()["bed_type"].get<int>());
+                            if (cali_it.value().contains("nozzle_pos_id"))
+                                preset_info.nozzle_pos_id = cali_it.value()["nozzle_pos_id"].get<int>();
+                            if (cali_it.value().contains("nozzle_sn"))
+                                preset_info.nozzle_sn = cali_it.value()["nozzle_sn"].get<std::string>();
                             preset_info.nozzle_diameter = cali_it.value()["nozzle_diameter"].get<float>();
                             preset_info.filament_id = cali_it.value()["filament_id"].get<std::string>();
                             preset_info.setting_id  = cali_it.value()["setting_id"].get<std::string>();
@@ -705,7 +796,7 @@ std::string AppConfig::load()
             }
         }
     } catch(std::exception err) {
-        BOOST_LOG_TRIVIAL(info) << format("parse app config \"%1%\", error: %2%", AppConfig::loading_path(), err.what());
+        BOOST_LOG_TRIVIAL(info) << format("parse app config \"%1%\", error: %2%", PathSanitizer::sanitize(AppConfig::loading_path()), err.what());
 
         return err.what();
     }
@@ -796,7 +887,10 @@ void AppConfig::save()
             preset_json["tray_id"] = filament_preset.tray_id;
             preset_json["extruder_id"]      = filament_preset.extruder_id;
             preset_json["nozzle_volume_type"]  = int(filament_preset.nozzle_volume_type);
+            preset_json["bed_type"] = int(filament_preset.bed_type);
             preset_json["nozzle_diameter"]  = filament_preset.nozzle_diameter;
+            preset_json["nozzle_pos_id"]    = filament_preset.nozzle_pos_id;
+            preset_json["nozzle_sn"]        = filament_preset.nozzle_sn;
             preset_json["filament_id"]      = filament_preset.filament_id;
             preset_json["setting_id"]       = filament_preset.setting_id;
             preset_json["name"]             = filament_preset.name;
@@ -817,9 +911,16 @@ void AppConfig::save()
             j[category.first] = j_filaments;
             continue;
         } else if (category.first == "presets") {
+            auto is_filament_preset_key = [](const std::string& key) -> bool {
+                if (key == "filament") return true;
+                if (key.size() > 9 && key.substr(0, 9) == "filament_") {
+                    return std::all_of(key.begin() + 9, key.end(), ::isdigit);
+                }
+                return false;
+            };
             json j_filament_array;
             for(const auto& kvp : category.second) {
-                if (boost::starts_with(kvp.first, "filament") && kvp.first != "filament_colors" && kvp.first != "filament_multi_colors" && kvp.first != "filament_color_types") {
+                if (is_filament_preset_key(kvp.first)) {
                     j_filament_array.push_back(kvp.second);
                 } else {
                     j[category.first][kvp.first] = kvp.second;
@@ -879,7 +980,7 @@ void AppConfig::save()
     std::string backup_path = (boost::format("%1%.bak") % path).str();
     // Copy configuration file with PID suffix into the configuration file with "bak" suffix.
     if (copy_file(path_pid, backup_path, error_message, false) != SUCCESS)
-        BOOST_LOG_TRIVIAL(error) << "Copying from " << path_pid << " to " << backup_path << " failed. Failed to create a backup configuration.";
+        BOOST_LOG_TRIVIAL(error) << "Copying from " << PathSanitizer::sanitize(path_pid) << " to " << PathSanitizer::sanitize(backup_path) << " failed. Failed to create a backup configuration.";
 #endif
 
     // Rename the config atomically.
@@ -904,7 +1005,7 @@ std::string AppConfig::load()
 #ifdef WIN32
         // Verify the checksum of the config file without taking just for debugging purpose.
         if (!verify_config_file_checksum(ifs))
-            BOOST_LOG_TRIVIAL(info) << "The configuration file " << AppConfig::loading_path() <<
+            BOOST_LOG_TRIVIAL(info) << "The configuration file " << PathSanitizer::sanitize(AppConfig::loading_path()) <<
             " has a wrong MD5 checksum or the checksum is missing. This may indicate a file corruption or a harmless user edit.";
 
         ifs.seekg(0, boost::nowide::ifstream::beg);
@@ -920,17 +1021,17 @@ std::string AppConfig::load()
             // Compute checksum of the configuration backup file and try to load configuration from it when the checksum is correct.
             boost::nowide::ifstream backup_ifs(backup_path);
             if (!verify_config_file_checksum(backup_ifs)) {
-                BOOST_LOG_TRIVIAL(error) << format("Both \"%1%\" and \"%2%\" are corrupted. It isn't possible to restore configuration from the backup.", AppConfig::loading_path(), backup_path);
+                BOOST_LOG_TRIVIAL(error) << format("Both \"%1%\" and \"%2%\" are corrupted. It isn't possible to restore configuration from the backup.", PathSanitizer::sanitize(AppConfig::loading_path()), PathSanitizer::sanitize(backup_path));
                 backup_ifs.close();
                 boost::filesystem::remove(backup_path);
             }
             else if (std::string error_message; copy_file(backup_path, AppConfig::loading_path(), error_message, false) != SUCCESS) {
-                BOOST_LOG_TRIVIAL(error) << format("Configuration file \"%1%\" is corrupted. Failed to restore from backup \"%2%\": %3%", AppConfig::loading_path(), backup_path, error_message);
+                BOOST_LOG_TRIVIAL(error) << format("Configuration file \"%1%\" is corrupted. Failed to restore from backup \"%2%\": %3%", PathSanitizer::sanitize(AppConfig::loading_path()), PathSanitizer::sanitize(backup_path), error_message);
                 backup_ifs.close();
                 boost::filesystem::remove(backup_path);
             }
             else {
-                BOOST_LOG_TRIVIAL(info) << format("Configuration file \"%1%\" was corrupted. It has been succesfully restored from the backup \"%2%\".", AppConfig::loading_path(), backup_path);
+                BOOST_LOG_TRIVIAL(info) << format("Configuration file \"%1%\" was corrupted. It has been succesfully restored from the backup \"%2%\".", PathSanitizer::sanitize(AppConfig::loading_path()), PathSanitizer::sanitize(backup_path));
                 // Try parse configuration file after restore from backup.
                 try {
                     ifs.open(AppConfig::loading_path());
@@ -938,13 +1039,13 @@ std::string AppConfig::load()
                     recovered = true;
                 }
                 catch (pt::ptree_error& ex) {
-                    BOOST_LOG_TRIVIAL(info) << format("Failed to parse configuration file \"%1%\" after it has been restored from backup: %2%", AppConfig::loading_path(), ex.what());
+                    BOOST_LOG_TRIVIAL(info) << format("Failed to parse configuration file \"%1%\" after it has been restored from backup: %2%", PathSanitizer::sanitize(AppConfig::loading_path()), ex.what());
                 }
             }
         }
         else
 #endif // WIN32
-            BOOST_LOG_TRIVIAL(info) << format("Failed to parse configuration file \"%1%\": %2%", AppConfig::loading_path(), ex.what());
+            BOOST_LOG_TRIVIAL(info) << format("Failed to parse configuration file \"%1%\": %2%", PathSanitizer::sanitize(AppConfig::loading_path()), ex.what());
         if (!recovered) {
             // Report the initial error of parsing PrusaSlicer.ini.
             // Error while parsing config file. We'll customize the error message and rethrow to be displayed.
@@ -1030,7 +1131,7 @@ void AppConfig::save()
     // The config is first written to a file with a PID suffix and then moved
     // to avoid race conditions with multiple instances of Slic3r
     const auto path = config_path();
-    std::string path_pid = (boost::format("%1%.%2%") % path % get_current_pid()).str();
+    std::string path_pid = (boost::format("%1%.%2%") % PathSanitizer::sanitize(path) % get_current_pid()).str();
 
     std::stringstream config_ss;
     if (m_mode == EAppMode::Editor)
@@ -1084,7 +1185,7 @@ void AppConfig::save()
     std::string backup_path = (boost::format("%1%.bak") % path).str();
     // Copy configuration file with PID suffix into the configuration file with "bak" suffix.
     if (copy_file(path_pid, backup_path, error_message, false) != SUCCESS)
-        BOOST_LOG_TRIVIAL(error) << "Copying from " << path_pid << " to " << backup_path << " failed. Failed to create a backup configuration.";
+        BOOST_LOG_TRIVIAL(error) << "Copying from " << path_pid << " to " << PathSanitizer::sanitize(backup_path) << " failed. Failed to create a backup configuration.";
 #endif
 
     // Rename the config atomically.
@@ -1195,7 +1296,7 @@ void AppConfig::set_recent_projects(const std::vector<std::string>& recent_proje
 }
 
 void AppConfig::set_mouse_device(const std::string& name, double translation_speed, double translation_deadzone,
-                                 float rotation_speed, float rotation_deadzone, double zoom_speed, bool swap_yz)
+                                 float rotation_speed, float rotation_deadzone, double zoom_speed, bool swap_yz, bool lock_horizon)
 {
     std::string key = std::string("mouse_device:") + name;
     auto it = m_storage.find(key);
@@ -1209,6 +1310,7 @@ void AppConfig::set_mouse_device(const std::string& name, double translation_spe
     it->second["rotation_deadzone"] = float_to_string_decimal_point(rotation_deadzone);
     it->second["zoom_speed"] = float_to_string_decimal_point(zoom_speed);
     it->second["swap_yz"] = swap_yz ? "1" : "0";
+    it->second["lock_horizon"] = lock_horizon ? "1" : "0";
 }
 
 std::vector<std::string> AppConfig::get_mouse_device_names() const
@@ -1412,14 +1514,14 @@ void AppConfig::reset_selections()
     }
 }
 
-std::string AppConfig::config_path()
+std::string AppConfig::config_path(EAppMode mode)
 {
 #ifdef USE_JSON_CONFIG
-    std::string path = (m_mode == EAppMode::Editor) ?
+    std::string path = (mode == EAppMode::Editor) ?
         (boost::filesystem::path(Slic3r::data_dir()) / (SLIC3R_APP_KEY ".conf")).make_preferred().string() :
         (boost::filesystem::path(Slic3r::data_dir()) / (GCODEVIEWER_APP_KEY ".conf")).make_preferred().string();
 #else
-    std::string path = (m_mode == EAppMode::Editor) ?
+    std::string path = (mode == EAppMode::Editor) ?
         (boost::filesystem::path(Slic3r::data_dir()) / (SLIC3R_APP_KEY ".ini")).make_preferred().string() :
         (boost::filesystem::path(Slic3r::data_dir()) / (GCODEVIEWER_APP_KEY ".ini")).make_preferred().string();
 #endif

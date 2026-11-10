@@ -6,7 +6,6 @@
 #include <stdexcept>
 
 #include <boost/format.hpp>
-#include <boost/log/trivial.hpp>
 #include <boost/filesystem.hpp>
 #if ENABLE_ENHANCED_IMGUI_SLIDER_FLOAT
 #include <boost/algorithm/string/predicate.hpp>
@@ -34,12 +33,18 @@
 #include "I18N.hpp"
 #include "Search.hpp"
 #include "BitmapCache.hpp"
+#include "FilamentBitmapUtils.hpp"
+#include "slic3r/GUI/UIHelpers/ImGuiFilamentWidgets.hpp"
 
 #include "../Utils/MacDarkMode.hpp"
+#ifdef __APPLE__
+#include "MacIME.hpp"
+#endif
 #include "nanosvg/nanosvg.h"
 #include "nanosvg/nanosvgrast.h"
 #include "OpenGLManager.hpp"
 #include "GUI_App.hpp"
+#include "libslic3r/Log.hpp"
 
 namespace Slic3r {
 namespace GUI {
@@ -132,6 +137,8 @@ static const std::map<const wchar_t, std::string> font_icons_large = {
     //{ImGui::DocumentationDarkButton     , "notification_documentation_dark"      },
     //{ImGui::DocumentationHoverDarkButton, "notification_documentation_hover_dark"},
     {ImGui::BlockNotifErrorIcon,          "block_notification_error"             },
+    {ImGui::CloseNotifCardButton,         "notification_card_close"              },
+    {ImGui::CollapseNotifCardButton,      "notification_card_collapse"           },
     {ImGui::PrevArrowBtnIcon,             "notification_arrow_left"              },
     {ImGui::NextArrowBtnIcon,             "notification_arrow_right"             },
     {ImGui::CompleteIcon,                 "notification_slicing_complete"        },
@@ -379,8 +386,21 @@ void ImGuiWrapper::set_language(const std::string &language)
         0x1EA0, 0x1EF9,
         0,
     };
+    // Same set as GetGlyphRangesOthers() plus the Greek and Coptic block, whose glyphs the
+    // bundled font already provides but the catch-all range never rasterized.
+    static const ImWchar ranges_greek[] =
+    {
+        0x0020, 0x00FF, // Basic Latin + Latin Supplement
+        0x0100, 0x017F, // Latin Extended-A
+        0x0180, 0x024F, // Latin Extended-B
+        0x0370, 0x03FF, // Greek and Coptic
+        0x2000, 0x206F, // General Punctuation
+        0xFF00, 0xFFEF, // Half-width characters
+        0,
+    };
     m_font_cjk = false;
     m_is_korean = false;
+    m_is_thai = false;
     if (lang == "cs" || lang == "pl") {
         ranges = ranges_latin2;
     } else if (lang == "ru" || lang == "uk") {
@@ -407,6 +427,9 @@ void ImGuiWrapper::set_language(const std::string &language)
         m_font_cjk = true;
     } else if (lang == "th") {
         ranges = ImGui::GetIO().Fonts->GetGlyphRangesThai(); // Default + Thai characters
+        m_is_thai = true;
+    } else if (lang == "el") {
+        ranges = ranges_greek;
     }
     else if (lang == "en") {
         ranges = ImGui::GetIO().Fonts->GetGlyphRangesEnglish(); // Basic Latin
@@ -460,9 +483,15 @@ bool ImGuiWrapper::update_mouse_data(wxMouseEvent& evt)
     io.MouseDown[0] = evt.LeftIsDown();
     io.MouseDown[1] = evt.RightIsDown();
     io.MouseDown[2] = evt.MiddleIsDown();
-    float wheel_delta = static_cast<float>(evt.GetWheelDelta());
-    if (wheel_delta != 0.0f) {
-        io.MouseWheel = evt.GetWheelRotation() > 0 ? 1.f : -1.f;
+    int wheel_delta = evt.GetWheelDelta();
+    if (wheel_delta != 0) {
+        int wheel_rotation = evt.GetWheelRotation();
+        if (wheel_rotation > 0)
+            io.MouseWheel = 1.f;
+        else if (wheel_rotation < 0)
+            io.MouseWheel = -1.f;
+        else
+            io.MouseWheel = 0.0f;
     }
     unsigned buttons = (evt.LeftIsDown() ? 1 : 0) | (evt.RightIsDown() ? 2 : 0) | (evt.MiddleIsDown() ? 4 : 0);
     m_mouse_buttons = buttons;
@@ -496,6 +525,7 @@ bool ImGuiWrapper::update_key_data(wxKeyEvent &evt)
         io.KeyCtrl = evt.ControlDown();
         io.KeyAlt = evt.AltDown();
         io.KeySuper = evt.MetaDown();
+        io.KeyMods = ImGui::GetMergedKeyModFlags();
     }
     bool ret = want_keyboard() || want_text_input();
     if (ret)
@@ -524,14 +554,10 @@ void ImGuiWrapper::new_frame()
     // when the application loses the focus it may happen that the key up event is not processed
 
     // synchronize modifier keys
-    constexpr std::array<std::pair<ImGuiKeyModFlags_, wxKeyCode>, 3> imgui_mod_keys{
-        std::make_pair(ImGuiKeyModFlags_Ctrl, WXK_CONTROL),
-        std::make_pair(ImGuiKeyModFlags_Shift, WXK_SHIFT),
-        std::make_pair(ImGuiKeyModFlags_Alt, WXK_ALT) };
-    for (const std::pair<ImGuiKeyModFlags_, wxKeyCode>& key : imgui_mod_keys) {
-        if ((io.KeyMods & key.first) != 0 && !wxGetKeyState(key.second))
-            io.KeyMods &= ~key.first;
-    }
+    io.KeyCtrl  = wxGetKeyState(WXK_CONTROL);
+    io.KeyShift = wxGetKeyState(WXK_SHIFT);
+    io.KeyAlt   = wxGetKeyState(WXK_ALT);
+    io.KeyMods  = ImGui::GetMergedKeyModFlags();
 
     // Not sure if it is neccessary
     // values from 33 to 126 are reserved for the standard ASCII characters
@@ -553,6 +579,13 @@ void ImGuiWrapper::new_frame()
 
 void ImGuiWrapper::render()
 {
+#ifdef __APPLE__
+    // Keep the focused canvas's IME context current for the whole time a text
+    // field wants input, so the macOS Chinese/English toggle and other
+    // modifier-only events reach it (see MacIME.hpp).
+    if (void *view = ImGui::GetIO().ImeWindowHandle)
+        mac_ime_sync_active(view, ImGui::GetIO().WantTextInput);
+#endif
     ImGui::Render();
     render_draw_data(ImGui::GetDrawData());
     m_new_frame_open = false;
@@ -777,6 +810,43 @@ bool ImGuiWrapper::bbl_slider_float_style(const std::string &label, float *v, fl
     ImGui::PopStyleVar(1);
 
     return ret;
+}
+
+void ImGuiWrapper::bbl_readonly_progress(float fraction, const ImVec2 &size, const ImVec4 &track_col, const ImVec4 &fill_col, const ImVec4 &thumb_col)
+{
+    fraction = std::clamp(fraction, 0.0f, 1.0f);
+
+    float frame_h = ImGui::GetFrameHeight();
+    float w       = size.x;
+    float h       = size.y > 0 ? size.y : frame_h;
+
+    // Dummy reserves layout space and vertically centers via SameLine
+    ImVec2 cursor = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(w, frame_h));
+
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+
+    float track_h   = h * 0.35f;
+    float track_y   = cursor.y + (frame_h - track_h) * 0.5f;
+    float rounding   = track_h * 0.5f;
+    float thumb_r    = track_h * 0.9f;
+
+    ImVec2 track_min(cursor.x, track_y);
+    ImVec2 track_max(cursor.x + w, track_y + track_h);
+
+    // gray background track
+    dl->AddRectFilled(track_min, track_max, ImGui::ColorConvertFloat4ToU32(track_col), rounding);
+
+    // green filled portion
+    if (fraction > 0.0f) {
+        float fill_x = cursor.x + w * fraction;
+        dl->AddRectFilled(track_min, ImVec2(fill_x, track_y + track_h), ImGui::ColorConvertFloat4ToU32(fill_col), rounding);
+    }
+
+    // round thumb
+    float thumb_cx = cursor.x + w * fraction;
+    float thumb_cy = track_y + track_h * 0.5f;
+    dl->AddCircleFilled(ImVec2(thumb_cx, thumb_cy), thumb_r, ImGui::ColorConvertFloat4ToU32(thumb_col), 24);
 }
 
 bool ImGuiWrapper::bbl_slider_float(const std::string& label, float* v, float v_min, float v_max, const char* format, float power, bool clamp, const wxString& tooltip)
@@ -1020,7 +1090,7 @@ bool ImGuiWrapper::checkbox(const wxString &label, bool &value)
     return ImGui::Checkbox(label_utf8.c_str(), &value);
 }
 
-bool ImGuiWrapper::bbl_checkbox(const wxString &label, bool &value)
+bool ImGuiWrapper::bbl_checkbox(const wxString &label, bool &value, bool enabled, bool b_dark_mode)
 {
     bool result;
     bool b_value = value;
@@ -1029,10 +1099,25 @@ bool ImGuiWrapper::bbl_checkbox(const wxString &label, bool &value)
         ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.00f, 0.68f, 0.26f, 1.00f));
         ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.00f, 0.68f, 0.26f, 1.00f));
     }
+    if (!enabled) {
+        float factor = b_value ? 0.8f : 1.0f;
+        if (b_dark_mode) {
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(factor * 39.0f / 255.0f, factor * 39.0f / 255.0f, factor * 39.0f / 255.0f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(factor * 108.0f / 255.0f, factor * 108.0f / 255.0f, factor * 108.0f / 255.0f, 1.0f));
+        }
+        else {
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(factor * 230.0f / 255.0f, factor * 230.0f / 255.0f, factor * 230.0f / 255.0f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(factor * 163.0f / 255.0f, factor * 163.0f / 255.0f, factor * 163.0f / 255.0f, 1.0f));
+        }
+    }
     auto label_utf8 = into_u8(label);
     result          = ImGui::BBLCheckbox(label_utf8.c_str(), &value);
 
+    if (!enabled) {
+        ImGui::PopStyleColor(2);
+    }
     if (b_value) { ImGui::PopStyleColor(3);}
+
     return result;
 }
 
@@ -1109,6 +1194,17 @@ void ImGuiWrapper::warning_text_wrapped(const char *all_text, float wrap_width) 
 void ImGuiWrapper::warning_text_wrapped(const wxString &all_text, float wrap_width) {
     auto label_utf8 = into_u8(all_text);
     warning_text_wrapped(label_utf8.c_str(), wrap_width);
+}
+
+void ImGuiWrapper::error_text_wrapped(const char *text, float wrap_width) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGuiWrapper::to_ImVec4(ColorRGB::ERROR_COLOR()));
+    this->text_wrapped(text, wrap_width);
+    ImGui::PopStyleColor();
+}
+
+void ImGuiWrapper::error_text_wrapped(const wxString &text, float wrap_width) {
+    auto label_utf8 = into_u8(text);
+    error_text_wrapped(label_utf8.c_str(), wrap_width);
 }
 
 void ImGuiWrapper::text_wrapped(const char *label, float wrap_width)
@@ -1478,13 +1574,14 @@ static bool selectable(const char* label, bool selected, ImGuiSelectableFlags fl
         ImGui::TablePopBackgroundChannel();
 
     // mark a label with a ColorMarkerHovered, if item is hovered
+    // Bound the copy: a menu label at or above 512 bytes must not write past this fixed buffer.
     char marked_label[512]; //255 symbols is not enough for translated string (e.t. to Russian)
     if (hovered || selected) {
-        sprintf(marked_label, "%c%s", ImGui::ColorMarkerHovered, label);
+        snprintf(marked_label, sizeof(marked_label), "%c%s", ImGui::ColorMarkerHovered, label);
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
     }
     else
-        strcpy(marked_label, label);
+        snprintf(marked_label, sizeof(marked_label), "%s", label);
 
     if (flags & ImGuiSelectableFlags_Disabled) ImGui::PushStyleColor(ImGuiCol_Text, style.Colors[ImGuiCol_TextDisabled]);
     ImGui::RenderTextClipped(text_min, text_max, marked_label, NULL, &label_size, style.SelectableTextAlign, &bb);
@@ -1517,7 +1614,7 @@ bool begin_menu(const char *label, bool enabled)
 
     // If a menu with same the ID was already submitted, we will append to it, matching the behavior of Begin().
     // We are relying on a O(N) search - so O(N log N) over the frame - which seems like the most efficient for the expected small amount of BeginMenu() calls per frame.
-    // If somehow this is ever becoming a problem we can switch to use e.g. ImGuiStorage mapping key to last frame used.
+    // If somehow this is ever becoming a problem we can switch to use e.g. ImGuiStorage mapping key to end frame used.
     if (g.MenusIdSubmittedThisFrame.contains(id)) {
         if (menu_is_open)
             menu_is_open = ImGui::BeginPopupEx(id, flags); // menu_is_open can be 'false' when the popup is completely clipped (e.g. zero size display)
@@ -2609,8 +2706,28 @@ void ImGuiWrapper::init_font(bool compress)
     builder.BuildRanges(&ranges); // Build the final result (ordered ranges with all the unique characters submitted)
 
     io.Fonts->Flags |= ImFontAtlasFlags_NoPowerOfTwoHeight;
+
+#ifdef __linux__
+    // Limit texture height to avoid exceeding GL_MAX_TEXTURE_SIZE
+    // Make the atlas wider to keep it shorter (height limit might be 16384 on XWayland)
+    io.Fonts->TexDesiredWidth = 8192;
+#endif
+
     ImFontConfig cfg = ImFontConfig();
     cfg.OversampleH = cfg.OversampleV = 1;
+
+    // None of the bundled UI fonts contains Thai glyphs, and unlike wxWidgets (which gets OS level
+    // font linking for free) ImGui draws every missing codepoint as the '?' fallback. Merge a
+    // Thai-only font on top of the font just added; merged fonts never overwrite glyphs the base
+    // font already provides, so Latin, CJK and the custom icon rects stay untouched.
+    auto merge_thai_font = [&](const char *file_name) {
+        if (!m_is_thai)
+            return;
+        ImFontConfig thai_cfg = cfg;
+        thai_cfg.MergeMode = true;
+        io.Fonts->AddFontFromFileTTF((Slic3r::resources_dir() + "/fonts/" + file_name).c_str(), m_font_size, &thai_cfg, ranges.Data);
+    };
+
     //FIXME replace with io.Fonts->AddFontFromMemoryTTF(buf_decompressed_data, (int)buf_decompressed_size, m_font_size, nullptr, ranges.Data);
     //https://github.com/ocornut/imgui/issues/220
     if (m_is_korean)
@@ -2623,6 +2740,7 @@ void ImGuiWrapper::init_font(bool compress)
             throw Slic3r::RuntimeError("ImGui: Could not load deafult font");
         }
     }
+    merge_thai_font("NotoSansThai-Regular.ttf");
 
     if (m_is_korean)
         bold_font = io.Fonts->AddFontFromFileTTF((Slic3r::resources_dir() + "/fonts/" + "NanumGothic-Bold.ttf").c_str(), m_font_size, &cfg, ranges.Data);
@@ -2632,6 +2750,7 @@ void ImGuiWrapper::init_font(bool compress)
         bold_font = io.Fonts->AddFontDefault();
         if (bold_font == nullptr) { throw Slic3r::RuntimeError("ImGui: Could not load deafult font"); }
     }
+    merge_thai_font("NotoSansThai-Bold.ttf");
 
 #ifdef _WIN32
     // Render the text a bit larger (see GLCanvas3D::_resize() and issue #3401), but only if the scale factor
@@ -2831,6 +2950,18 @@ void ImGuiWrapper::init_input()
 
     // Don't let imgui special-case Mac, wxWidgets already do that
     io.ConfigMacOSXBehaviors = false;
+
+#ifdef __APPLE__
+    // Forward the input cursor position imgui reports for the focused text widget
+    // to the macOS IME bridge so the candidate window is anchored at the caret.
+    // io.ImeWindowHandle carries the focused canvas NSView (set on focus change).
+    io.ImeSetInputScreenPosFn = [](int x, int y) {
+        if (void *view = ImGui::GetIO().ImeWindowHandle)
+            mac_ime_set_caret(view, x, y, 0);
+    };
+#endif
+    // Windows: keep imgui's default ImeSetInputScreenPosFn (ImmSetCompositionWindow).
+    // It needs io.ImeWindowHandle = canvas HWND, set in GLCanvas3D focus / ImGui click.
 
     // Setup clipboard interaction callbacks
     io.SetClipboardTextFn = clipboard_set;
@@ -3110,44 +3241,26 @@ std::tuple<ImVec2, bool>  ImGuiWrapper::calculate_filament_group_text_size(const
 void ImGuiWrapper::filament_group(const std::string& filament_type, const char* hex_color, unsigned char filament_id, float align_width)
 {
     //ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    std::string id = std::to_string(static_cast<unsigned int> (filament_id + 1));
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
-    static ImTextureID transparent;
-    ImVec2             text_size = ImGui::CalcTextSize(filament_type.c_str());
     // BBS image sizing based on text width (DPI scaling)
     float         img_width = ImGui::CalcTextSize("ABC").x;
     ImVec2        img_size = { img_width, img_width };
-    ImVec2        id_text_size = this->calc_text_size(id);
-    unsigned char rgba[4];
-    rgba[3] = 0xff;
-    Slic3r::GUI::BitmapCache::parse_color4(hex_color, rgba);
-    std::string svg_path = "/images/outlined_rect.svg";
-    if (rgba[3] == 0x00) {
-        svg_path = "/images/outlined_rect_transparent.svg";
-    }
-    BitmapCache::load_from_svg_file_change_color(Slic3r::resources_dir() + svg_path, img_size.x, img_size.y, transparent, hex_color);
+
     ImGui::BeginGroup();
     {
         ImVec2 cursor_pos = ImGui::GetCursorScreenPos();
-        draw_list->AddImage(transparent, cursor_pos, { cursor_pos.x + img_size.x, cursor_pos.y + img_size.y }, { 0, 0 }, { 1, 1 }, ImGui::GetColorU32(ImVec4(1.f, 1.f, 1.f, 1.f)));
-        // image border test
-        // draw_list->AddRect(cursor_pos, {cursor_pos.x + img_size.x, cursor_pos.y + img_size.y}, IM_COL32(0, 0, 0, 255));
-        ImVec2 current_cursor = ImGui::GetCursorPos();
-        ImGui::SetCursorPos({ current_cursor.x + (img_size.x - id_text_size.x) * 0.5f, current_cursor.y + (img_size.y - id_text_size.y) * 0.5f });
-
-        float gray = 0.299 * rgba[0] + 0.587 * rgba[1] + 0.114 * rgba[2];
-        ImVec4 text_color = gray < 80 ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f) : ImVec4(0, 0, 0, 1.0f);
-        this->text_colored(text_color, id.c_str());
+        const ImVec2 swatch_max = { cursor_pos.x + img_size.x, cursor_pos.y + img_size.y };
+        ImGuiFilament::draw_filament_icon(draw_list, cursor_pos, swatch_max, static_cast<int>(filament_id), hex_color);
+        ImGui::Dummy(img_size);
 
         auto wrapped_text_info = calculate_filament_group_text_size(filament_type);
         ImVec2 wrapped_text_size = std::get<0>(wrapped_text_info);
         bool is_multiline = std::get<1>(wrapped_text_info);
 
         float text_y_offset = 4.f;
-        float text_x_offset = is_multiline ? (img_size.x - wrapped_text_size.x) * 0.5f + 2.f : (img_size.x - wrapped_text_size.x) * 0.5f + 2.f;
+        float text_x_offset = (img_size.x - wrapped_text_size.x) * 0.5f + 2.f;
 
-        auto cursor_x_before_text = ImGui::GetCursorPosX();
-        current_cursor = ImGui::GetCursorPos();
+        ImVec2 current_cursor = ImGui::GetCursorPos();
         ImGui::SetCursorPos({
             current_cursor.x + text_x_offset,
             current_cursor.y + text_y_offset

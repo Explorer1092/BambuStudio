@@ -4,5 +4,15 @@
     "inherits": "fdm_filament_pps",
     "from": "system",
     "filament_id": "GFT97",
-    "instantiation": "false"
+    "instantiation": "false",
+    "filament_dev_ams_drying_temperature": [
+        "65",
+        "80",
+        "65",
+        "80",
+        "85",
+        "85",
+        "65",
+        "65"
+    ]
 }

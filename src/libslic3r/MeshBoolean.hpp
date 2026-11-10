@@ -22,6 +22,16 @@ void self_union(EigenMesh &A);
 void minus(TriangleMesh& A, const TriangleMesh& B);
 void self_union(TriangleMesh& mesh);
 
+// Backend-neutral boolean entry point. Prefers the OpenMeshCraft backend when it is
+// compiled in (the default, SLIC3R_ENABLE_OPENMESHCRAFT_BOOLEAN) and falls back to MCUT
+// only for builds that do not package OpenMeshCraft (e.g. the Linux CLI). New code should
+// call this instead of mcut::make_boolean, which is now considered the fallback backend.
+void make_boolean(const TriangleMesh &src_mesh, const TriangleMesh &cut_mesh,
+                  std::vector<TriangleMesh> &dst_mesh, const std::string &boolean_opts,
+                  const std::function<bool()> &cancel_cb   = nullptr,
+                  const std::function<void(float)> &progress_cb = nullptr,
+                  const std::function<void()> &failed_cb   = nullptr);
+
 namespace cgal {
 
 struct CGALMesh;
@@ -84,17 +94,30 @@ bool empty(const McutMesh &mesh);
 McutMeshPtr  triangle_mesh_to_mcut(const indexed_triangle_set &M);
 TriangleMesh mcut_to_triangle_mesh(const McutMesh &mcutmesh);
 
+using BooleanCancelCB = std::function<bool()>;
+using BooleanProgressCB = std::function<void(float)>;
+using BooleanFailedCB = std::function<void()>;
 // do boolean and save result to srcMesh
 // return true if sucessful
-bool do_boolean_single(McutMesh& srcMesh, const McutMesh& cutMesh, const std::string& boolean_opts);
+bool do_boolean_single(McutMesh& srcMesh, const McutMesh& cutMesh, const std::string& boolean_opts, const BooleanCancelCB& cancel_cb = nullptr, const BooleanProgressCB& progress_cb = nullptr);
 // do boolean of mesh with multiple volumes and save result to srcMesh
 // Both srcMesh and cutMesh may have multiple volumes.
-void do_boolean(McutMesh &srcMesh, const McutMesh &cutMesh, const std::string &boolean_opts);
+bool do_boolean(McutMesh &srcMesh, const McutMesh &cutMesh, const std::string &boolean_opts, const BooleanCancelCB& cancel_cb = nullptr, const BooleanProgressCB& progress_cb = nullptr, const BooleanFailedCB& failed_cb = nullptr);
 
 
 // do boolean and convert result to TriangleMesh
-void make_boolean(const TriangleMesh &src_mesh, const TriangleMesh &cut_mesh, std::vector<TriangleMesh> &dst_mesh, const std::string &boolean_opts);
+void make_boolean(const TriangleMesh &src_mesh, const TriangleMesh &cut_mesh, std::vector<TriangleMesh> &dst_mesh, const std::string &boolean_opts, const BooleanCancelCB& calcen_cb = nullptr, const BooleanProgressCB& progress_cb = nullptr, const BooleanFailedCB& failed_cb = nullptr);
 } // namespace mcut
+
+namespace openmeshcraft {
+using BooleanCancelCB = mcut::BooleanCancelCB;
+using BooleanProgressCB = mcut::BooleanProgressCB;
+using BooleanFailedCB = mcut::BooleanFailedCB;
+
+// Compile-time switch (SLIC3R_ENABLE_OPENMESHCRAFT_BOOLEAN), not a runtime env-var check.
+bool is_enabled();
+void make_boolean(const TriangleMesh &src_mesh, const TriangleMesh &cut_mesh, std::vector<TriangleMesh> &dst_mesh, const std::string &boolean_opts, const BooleanCancelCB& cancel_cb = nullptr, const BooleanProgressCB& progress_cb = nullptr, const BooleanFailedCB& failed_cb = nullptr);
+} // namespace openmeshcraft
 
 } // namespace MeshBoolean
 } // namespace Slic3r

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <string>
 #include "GCodeWriter.hpp"
 #include "PrintConfig.hpp"
@@ -37,6 +38,7 @@ struct Calib_Params
 {
     Calib_Params() : mode(CalibMode::Calib_None){}
     int extruder_id = 0;
+    bool has_bowden_extruder = false;
     double start, end, step;
     bool print_numbers = false;
     CalibMode mode;
@@ -77,7 +79,10 @@ public:
     int         tray_id;
     int         extruder_id;
     NozzleVolumeType nozzle_volume_type;
+    BedType     bed_type;
     float       nozzle_diameter;
+    int         nozzle_pos_id{-1};
+    std::string nozzle_sn;
     std::string filament_id;
     std::string setting_id;
     std::string name;
@@ -88,6 +93,8 @@ public:
         this->extruder_id     = other.extruder_id;
         this->nozzle_volume_type = other.nozzle_volume_type;
         this->nozzle_diameter = other.nozzle_diameter;
+        this->nozzle_pos_id   = other.nozzle_pos_id;
+        this->nozzle_sn       = other.nozzle_sn;
         this->filament_id     = other.filament_id;
         this->setting_id      = other.setting_id;
         this->name            = other.name;
@@ -99,7 +106,7 @@ struct PrinterCaliInfo
 {
     std::string                 dev_id;
     bool                        cali_finished = true;
-    float                       cache_flow_ratio;
+    float                       cache_flow_ratio{0.f};
     std::vector<CaliPresetInfo> selected_presets;
     FlowRatioCalibrationType    cache_flow_rate_calibration_type = FlowRatioCalibrationType::COMPLETE_CALIBRATION;
 };
@@ -118,7 +125,9 @@ public:
     int         ams_id = 0;
     int         slot_id = 0;
     int         cali_idx = -1;
+    int         nozzle_pos_id = -1; //-1 means no nozzle pos
     float       nozzle_diameter;
+    std::string nozzle_sn;
     std::string filament_id;
     std::string setting_id;
     std::string name;
@@ -135,7 +144,9 @@ struct PACalibIndexInfo
     int         ams_id = 0;
     int         slot_id = 0;
     int         cali_idx = -1; // -1 means default
+    int         nozzle_pos_id = -1; //-1 means no nozzle pos
     float       nozzle_diameter;
+    std::string nozzle_sn;
     std::string filament_id;
 };
 
@@ -143,8 +154,11 @@ struct PACalibExtruderInfo
 {
     int              extruder_id = 0;
     NozzleVolumeType nozzle_volume_type;
+    int              nozzle_pos_id = -1; //-1 means no nozzle pos
     float            nozzle_diameter;
+    std::string      nozzle_sn;
     std::string      filament_id = "";
+    bool             use_nozzle_diameter{true};
     bool             use_extruder_id{true};
     bool             use_nozzle_volume_type{true};
 };
@@ -183,6 +197,8 @@ class CalibPressureAdvance
 public:
     static float find_optimal_PA_speed(const DynamicPrintConfig &config, double line_width, double layer_height, int extruder_id = 0, int filament_idx = 0);
 
+    void set_bbl_bowden_mode() { m_is_bbl_bowden = true; }
+
 protected:
     CalibPressureAdvance() = default;
     CalibPressureAdvance(const DynamicPrintConfig &config) : m_config(config){};
@@ -211,6 +227,7 @@ protected:
 
     Vec3d              m_last_pos;
     DynamicPrintConfig m_config;
+    bool               m_is_bbl_bowden = false;
 
     const double                 m_encroachment{1. / 3.};
     DrawDigitMode                m_draw_digit_mode{DrawDigitMode::Left_To_Right};
@@ -260,7 +277,18 @@ private:
 
 struct SuggestedConfigCalibPAPattern
 {
-    const std::vector<std::pair<std::string, double>> float_pairs{{"initial_layer_print_height", 0.25}, {"layer_height", 0.2}};
+    static constexpr double nozzle_diameter_0_2 = 0.2;
+    static constexpr double nozzle_compare_epsilon = 1e-6;
+
+    double initial_layer_print_height(double nozzle_diameter) const
+    {
+        return std::abs(nozzle_diameter - nozzle_diameter_0_2) < nozzle_compare_epsilon ? 0.2 : 0.25;
+    }
+
+    std::vector<std::pair<std::string, double>> float_pairs(double nozzle_diameter) const
+    {
+        return {{"initial_layer_print_height", initial_layer_print_height(nozzle_diameter)}, {"layer_height", 0.2}};
+    }
 
     const std::vector<std::pair<std::string, std::vector<double>>> floats_pairs{{"initial_layer_speed", {30}}};
 

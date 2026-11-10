@@ -51,6 +51,8 @@ class ImGuiWrapper
     // Chinese, Japanese, Korean
     bool m_font_cjk{ false };
     bool m_is_korean{ false };
+    // Thai glyphs are absent from every bundled font, so a Thai-only font is merged on top.
+    bool m_is_thai{ false };
     float m_font_size{ 18.0 };
     unsigned m_font_texture{ 0 };
     unsigned m_font_another_texture{ 0 };
@@ -79,6 +81,9 @@ public:
 
     ImGuiWrapper();
     ~ImGuiWrapper();
+
+    // True when the UI font set was loaded for Korean (NanumGothic instead of HarmonyOS).
+    bool is_korean() const { return m_is_korean; }
 
     void read_glsl_version();
 
@@ -119,6 +124,7 @@ public:
     bool bbl_input_double(const wxString &label, const double &value, const std::string &format = "%0.2f");
     bool bbl_slider_float(const std::string &label, float* v, float v_min, float v_max, const char* format = "%.3f", float power = 1.0f, bool clamp = true, const wxString& tooltip = {});
     bool bbl_slider_float_style(const std::string &label, float* v, float v_min, float v_max, const char* format = "%.3f", float power = 1.0f, bool clamp = true, const wxString& tooltip = {});
+    void bbl_readonly_progress(float fraction, const ImVec2 &size, const ImVec4 &track_col = ImVec4(0.85f, 0.85f, 0.85f, 0.6f), const ImVec4 &fill_col = ImVec4(0.27f, 0.71f, 0.27f, 1.0f), const ImVec4 &thumb_col = ImVec4(0.20f, 0.65f, 0.20f, 1.0f));
 
     bool begin(const std::string &name, int flags = 0);
     bool begin(const wxString &name, int flags = 0);
@@ -151,7 +157,7 @@ public:
     bool input_double(const wxString &label, const double &value, const std::string &format = "%.3f");
     bool input_vec3(const std::string &label, const Vec3d &value, float width, const std::string &format = "%.3f");
     bool checkbox(const wxString &label, bool &value);
-    bool bbl_checkbox(const wxString &label, bool &value);
+    bool bbl_checkbox(const wxString &label, bool &value, bool enabled = true, bool b_dark_mode = false);
     bool bbl_radio_button(const char *label, bool active);
     bool bbl_sliderin(const char *label, int *v, int v_min, int v_max, const char *format = "%d", ImGuiSliderFlags flags = 0);
     static void text(const char *label);
@@ -164,6 +170,8 @@ public:
     static void  text_colored(const ImVec4 &color, const wxString &label);
     void warning_text_wrapped(const char *all_text, float wrap_width);
     void warning_text_wrapped(const wxString &all_text, float wrap_width);
+    void error_text_wrapped(const char *text, float wrap_width);
+    void error_text_wrapped(const wxString &text, float wrap_width);
     void text_wrapped(const char *label, float wrap_width);
     void text_wrapped(const std::string &label, float wrap_width);
     void text_wrapped(const wxString &label, float wrap_width);

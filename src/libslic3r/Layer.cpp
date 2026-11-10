@@ -6,8 +6,8 @@
 #include "SVG.hpp"
 #include "BoundingBox.hpp"
 #include "libslic3r/AABBTreeLines.hpp"
-#include <boost/log/trivial.hpp>
 #include "PerimeterGenerator.hpp"
+#include "libslic3r/Log.hpp"
 static const int Continuitious_length = scale_(0.01);
 static const int dist_scale_threshold = 1.2;
 
@@ -84,22 +84,46 @@ static inline bool layer_needs_raw_backup(const Layer *layer)
 void Layer::backup_untyped_slices()
 {
     if (layer_needs_raw_backup(this)) {
-        for (LayerRegion *layerm : m_regions)
+        for (LayerRegion *layerm : m_regions) {
             layerm->raw_slices = to_expolygons(layerm->slices.surfaces);
+            layerm->raw_counter_circle_compensation.clear();
+            layerm->raw_holes_circle_compensation.clear();
+            for (Surface &surface : layerm->slices.surfaces) {
+                layerm->raw_counter_circle_compensation.push_back(surface.counter_circle_compensation);
+                layerm->raw_holes_circle_compensation.push_back(surface.holes_circle_compensation);
+            }
+        }
     } else {
         assert(m_regions.size() == 1);
         m_regions.front()->raw_slices.clear();
+        m_regions.front()->raw_counter_circle_compensation.clear();
+        m_regions.front()->raw_holes_circle_compensation.clear();
     }
 }
 
 void Layer::restore_untyped_slices()
 {
     if (layer_needs_raw_backup(this)) {
-        for (LayerRegion *layerm : m_regions)
+        for (LayerRegion *layerm : m_regions) {
             layerm->slices.set(layerm->raw_slices, stInternal);
+            int surface_idx = 0;
+            for (Surface &surface : layerm->slices.surfaces) {
+                if (surface_idx < layerm->raw_counter_circle_compensation.size()
+                    && surface_idx < layerm->raw_holes_circle_compensation.size()) {
+                    surface.counter_circle_compensation = layerm->raw_counter_circle_compensation[surface_idx];
+                    surface.holes_circle_compensation   = layerm->raw_holes_circle_compensation[surface_idx];
+                }
+            }
+        }
     } else {
         assert(m_regions.size() == 1);
         m_regions.front()->slices.set(this->lslices, stInternal);
+        if (0 < m_regions.front()->raw_counter_circle_compensation.size()
+            && 0 < m_regions.front()->raw_holes_circle_compensation.size()
+            && 0 < m_regions.front()->slices.surfaces.size()) {
+            m_regions.front()->slices.surfaces.front().counter_circle_compensation = m_regions.front()->raw_counter_circle_compensation.front();
+            m_regions.front()->slices.surfaces.front().holes_circle_compensation   = m_regions.front()->raw_holes_circle_compensation.front();
+        }
     }
 }
 
@@ -148,26 +172,29 @@ ExPolygons Layer::merged(float offset_scaled) const
 // If there is any incompatibility, separate LayerRegions have to be created.
 bool Layer::has_compatible_layer_regions(const PrintRegionConfig &config, const PrintRegionConfig &other_config)
 {
-    return config.wall_filament             == other_config.wall_filament
-        && config.wall_loops                  == other_config.wall_loops
-        && config.inner_wall_speed.get_at(get_extruder_id(config.wall_filament))  == other_config.inner_wall_speed.get_at(get_extruder_id(config.wall_filament))
-        && config.outer_wall_speed.get_at(get_extruder_id(config.wall_filament))  == other_config.outer_wall_speed.get_at(get_extruder_id(config.wall_filament))
-        && config.gap_infill_speed.get_at(get_extruder_id(config.wall_filament))  == other_config.gap_infill_speed.get_at(get_extruder_id(config.wall_filament))
-        && config.detect_overhang_wall                   == other_config.detect_overhang_wall
-        && config.filter_out_gap_fill.value == other_config.filter_out_gap_fill.value
-        && config.opt_serialize("inner_wall_line_width") == other_config.opt_serialize("inner_wall_line_width")
-        && config.detect_thin_wall                  == other_config.detect_thin_wall
-        && config.infill_wall_overlap              == other_config.infill_wall_overlap
-        && config.seam_slope_conditional == other_config.seam_slope_conditional
-        && config.override_filament_scarf_seam_setting == other_config.override_filament_scarf_seam_setting
-        && config.seam_slope_type                      == other_config.seam_slope_type
-        && config.seam_slope_start_height              == other_config.seam_slope_start_height
-        && config.seam_slope_gap                       == other_config.seam_slope_gap
-        && config.seam_slope_min_length                == other_config.seam_slope_min_length
-        //&& config.scarf_angle_threshold  == other_config.scarf_angle_threshold
-        && config.seam_slope_entire_loop  == other_config.seam_slope_entire_loop
-        && config.seam_slope_steps        == other_config.seam_slope_steps
-        && config.seam_slope_inner_walls  == other_config.seam_slope_inner_walls;
+    return config.wall_filament == other_config.wall_filament
+           && config.wall_loops == other_config.wall_loops
+           && config.wall_sequence == other_config.wall_sequence
+           && config.inner_wall_speed.get_at(get_process_config_idx(config.wall_filament)) == other_config.inner_wall_speed.get_at(get_process_config_idx(config.wall_filament))
+           && config.outer_wall_speed.get_at(get_process_config_idx(config.wall_filament)) == other_config.outer_wall_speed.get_at(get_process_config_idx(config.wall_filament))
+           && config.gap_infill_speed.get_at(get_process_config_idx(config.wall_filament)) == other_config.gap_infill_speed.get_at(get_process_config_idx(config.wall_filament))
+           && config.bridge_speed.get_at(get_process_config_idx(config.wall_filament)) == other_config.bridge_speed.get_at(get_process_config_idx(config.wall_filament))
+           && config.detect_overhang_wall == other_config.detect_overhang_wall
+           && config.filter_out_gap_fill.value == other_config.filter_out_gap_fill.value
+           && config.opt_serialize("inner_wall_line_width") == other_config.opt_serialize("inner_wall_line_width")
+           && config.opt_serialize("outer_wall_line_width") == other_config.opt_serialize("outer_wall_line_width")
+           && config.detect_thin_wall == other_config.detect_thin_wall
+           && config.infill_wall_overlap == other_config.infill_wall_overlap
+           && config.override_filament_scarf_seam_setting == other_config.override_filament_scarf_seam_setting
+           && config.seam_slope_type == other_config.seam_slope_type
+           && config.seam_slope_start_height == other_config.seam_slope_start_height
+           && config.seam_slope_gap == other_config.seam_slope_gap
+           && config.seam_slope_min_length == other_config.seam_slope_min_length
+           && config.seam_slope_conditional == other_config.seam_slope_conditional
+           && config.seam_slope_entire_loop == other_config.seam_slope_entire_loop
+           && config.seam_slope_steps == other_config.seam_slope_steps
+           && config.seam_slope_inner_walls == other_config.seam_slope_inner_walls
+           && (this->id() != 0 || config.initial_layer_flow_ratio == other_config.initial_layer_flow_ratio);
 }
 
 // Here the perimeters are created cummulatively for all layer regions sharing the same parameters influencing the perimeters.
@@ -178,9 +205,37 @@ void Layer::make_perimeters()
     BOOST_LOG_TRIVIAL(trace) << "Generating perimeters for layer " << this->id();
     // keep track of regions whose perimeters we have already generated
     std::vector<unsigned char> done(m_regions.size(), false);
+    auto same_merge_patches = [](const LayerRegion *lhs, const LayerRegion *rhs) {
+        const bool lhs_merged = ! lhs->adaptive_merge_patches.empty();
+        const bool rhs_merged = ! rhs->adaptive_merge_patches.empty();
+        if (lhs_merged != rhs_merged)
+            return false;
+        if (! lhs_merged)
+            return true;
+        // A layer may carry both markers of a slab above and a local group top of its own. The group top
+        // of a secondary region would be lost in a shared pass, so any extruding group top forbids it.
+        auto has_extruding_group_top = [](const LayerRegion *layerm) {
+            return std::any_of(layerm->adaptive_merge_patches.begin(), layerm->adaptive_merge_patches.end(),
+                               [](const AdaptiveMergePatch &patch) { return patch.group_top && ! patch.area().empty(); });
+        };
+        if (has_extruding_group_top(lhs) || has_extruding_group_top(rhs))
+            return false;
+        const AdaptiveMergePatch &a = lhs->adaptive_merge_patches.front();
+        const AdaptiveMergePatch &b = rhs->adaptive_merge_patches.front();
+        if (a.bottom_idx != b.bottom_idx || a.top_idx != b.top_idx || a.group_top != b.group_top)
+            return false;
+        // A layer swallowed by the band above it extrudes nothing, so its regions can share one shell
+        // discovery pass. A group top clips against the contour it retained, which no two regions share.
+        return ! a.group_top;
+    };
 
-    for (LayerRegionPtrs::iterator layerm = m_regions.begin(); layerm != m_regions.end(); ++ layerm)
-    	if ((*layerm)->slices.empty()) {
+    for (LayerRegionPtrs::iterator layerm = m_regions.begin(); layerm != m_regions.end(); ++ layerm) {
+        const bool has_first_band_source = std::any_of(
+            (*layerm)->adaptive_merge_patches.begin(), (*layerm)->adaptive_merge_patches.end(),
+            [](const AdaptiveMergePatch &patch) {
+                return patch.group_top && patch.bottom_idx == 0 && ! patch.area().empty();
+            });
+        if ((*layerm)->slices.empty() && ! has_first_band_source) {
  			(*layerm)->perimeters.clear();
  			(*layerm)->fills.clear();
  			(*layerm)->thin_fills.clear();
@@ -206,6 +261,11 @@ void Layer::make_perimeters()
                 const PrintRegionConfig &other_config = other_layerm->region().config();
                 if (!has_compatible_layer_regions(config, other_config))
                     continue;
+                if ((*layerm)->region().gradient_volume_id() != other_layerm->region().gradient_volume_id())
+                    continue;
+                // A shared perimeter pass can only honor the merge plan of its front region.
+                if (! same_merge_patches(*layerm, other_layerm))
+                    continue;
 
                 other_layerm->perimeters.clear();
                 other_layerm->fills.clear();
@@ -219,23 +279,101 @@ void Layer::make_perimeters()
                 }
             }
 
+            // BBS multi-diameter adaptive layer height: a region inside a band is extruded on the group top
+            // only, at the height of the whole band. The layers below it are dropped, not merged into it.
+            auto generate_region_perimeters = [&](LayerRegion *lm, const SurfaceCollection &src,
+                                                  SurfaceCollection *out_fill, ExPolygons *out_no_overlap) {
+                if (lm->adaptive_merge_patches.empty()) {
+                    lm->make_perimeters(src, perimeter_regions, out_fill, out_no_overlap, this->loop_nodes);
+                    return;
+                }
+
+                const auto group_top_patch = std::find_if(
+                    lm->adaptive_merge_patches.begin(), lm->adaptive_merge_patches.end(),
+                    [](const AdaptiveMergePatch &patch) { return patch.group_top; });
+                if (group_top_patch == lm->adaptive_merge_patches.end()) {
+                    // Swallowed by the group top, so nothing is extruded here. The fill surfaces still have
+                    // to pass through shell discovery, otherwise a solid layer inside the band disappears
+                    // before combine_adaptive_infill() can promote it.
+                    lm->make_perimeters(src, perimeter_regions, out_fill, out_no_overlap,
+                                        this->loop_nodes, 0., true, nullptr, nullptr, true);
+                    return;
+                }
+
+                // All local boundary pieces share this fixed group top, so their ceiling is identical.
+                ExPolygons upper_slices_storage;
+                const ExPolygons *upper_slices = nullptr;
+                const size_t top_idx = group_top_patch->top_idx;
+                if (top_idx + 1 < this->object()->layer_count()) {
+                    // The next physical layer may be swallowed by another adaptive band. Build the
+                    // footprint that band will actually extrude so top-only walls see the real ceiling.
+                    const Layer *upper_layer = this->object()->get_layer(int(top_idx + 1));
+                    Polygons upper_footprint;
+                    for (const LayerRegion *upper_region : upper_layer->regions()) {
+                        if (upper_region->adaptive_merge_patches.empty()) {
+                            polygons_append(upper_footprint, to_polygons(upper_region->slices.surfaces));
+                        } else {
+                            for (const AdaptiveMergePatch &upper_patch : upper_region->adaptive_merge_patches)
+                                polygons_append(upper_footprint, to_polygons(upper_patch.area()));
+                        }
+                    }
+                    upper_slices_storage = union_ex(upper_footprint);
+                    upper_slices = &upper_slices_storage;
+                }
+
+                bool generated = false;
+                for (const AdaptiveMergePatch &patch : lm->adaptive_merge_patches) {
+                    if (! patch.group_top || patch.area().empty())
+                        continue;
+
+                    SurfaceCollection core_slices;
+                    const SurfaceCollection &patch_source = patch.bottom_idx == 0 ?
+                        this->object()->get_layer(0)->get_region(region_id)->slices : src;
+                    for (const Surface &s : patch_source.surfaces)
+                        for (ExPolygon &e : intersection_ex(ExPolygons{ s.expolygon }, patch.area()))
+                            core_slices.surfaces.emplace_back(s, std::move(e));
+                    if (core_slices.surfaces.empty())
+                        continue;
+
+                    // Each local piece rests immediately above its own obstruction. A suppressed orphan there is
+                    // sliced but not extruded, so the walls over it overhang.
+                    const ExPolygons *lower_slices = nullptr;
+                    ExPolygons        lower_storage;
+                    if (patch.bottom_idx > 0) {
+                        const Layer     *lower   = this->object()->get_layer(int(patch.bottom_idx - 1));
+                        const ExPolygons dropped = adaptive_suppressed_orphan_area(*lower);
+                        if (dropped.empty())
+                            lower_slices = &lower->lslices;
+                        else {
+                            lower_storage = diff_ex(lower->lslices, dropped);
+                            lower_slices  = &lower_storage;
+                        }
+                    }
+                    lm->make_perimeters(core_slices, perimeter_regions, out_fill, out_no_overlap,
+                                        this->loop_nodes, patch.merged_height, ! generated,
+                                        lower_slices, upper_slices, false, patch.bottom_idx == 0);
+                    generated = true;
+                }
+                if (! generated) {
+                    lm->perimeters.clear();
+                    lm->thin_fills.clear();
+                }
+            };
+
 	        if (layerms.size() == 1) {  // optimization
 	            (*layerm)->fill_surfaces.surfaces.clear();
-                (*layerm)->make_perimeters((*layerm)->slices, perimeter_regions, &(*layerm)->fill_surfaces, &(*layerm)->fill_no_overlap_expolygons, this->loop_nodes);
+                (*layerm)->fill_no_overlap_expolygons.clear();
+                generate_region_perimeters(*layerm, (*layerm)->slices, &(*layerm)->fill_surfaces, &(*layerm)->fill_no_overlap_expolygons);
 
 	            (*layerm)->fill_expolygons = to_expolygons((*layerm)->fill_surfaces.surfaces);
 	        } else {
 	            SurfaceCollection new_slices;
-	            // Use the region with highest infill rate, as the make_perimeters() function below decides on the gap fill based on the infill existence.
-	            LayerRegion *layerm_config = layerms.front();
 	            {
 	                // group slices (surfaces) according to number of extra perimeters
 	                std::map<unsigned short, Surfaces> slices;  // extra_perimeters => [ surface, surface... ]
 	                for (LayerRegion *layerm : layerms) {
 	                    for (const Surface &surface : layerm->slices.surfaces)
 	                        slices[surface.extra_perimeters].emplace_back(surface);
-	                    if (layerm->region().config().sparse_infill_density > layerm_config->region().config().sparse_infill_density)
-	                    	layerm_config = layerm;
 	                }
 	                // merge the surfaces assigned to each group
 	                for (std::pair<const unsigned short,Surfaces> &surfaces_with_extra_perimeters : slices)
@@ -251,7 +389,7 @@ void Layer::make_perimeters()
 	            SurfaceCollection fill_surfaces;
                 //BBS
                 ExPolygons fill_no_overlap;
-                layerm_config->make_perimeters(new_slices, perimeter_regions, &fill_surfaces, &fill_no_overlap, this->loop_nodes);
+                generate_region_perimeters(*layerm, new_slices, &fill_surfaces, &fill_no_overlap);
 
 	            // assign fill_surfaces to each layer
 	            if (!fill_surfaces.surfaces.empty()) {
@@ -266,6 +404,7 @@ void Layer::make_perimeters()
 	            }
 	        }
 	    }
+    }
 
     BOOST_LOG_TRIVIAL(trace) << "Generating perimeters for layer " << this->id() << " - Done";
 }
@@ -574,6 +713,7 @@ coordf_t Layer::get_sparse_infill_max_void_area()
             case ipHilbertCurve:
             case ip3DHoneycomb:
             case ipArchimedeanChords:
+            case ip2DLattice: //this function seems to have been abandoned, there's no anywhere called this
                 max_void_area = std::max(max_void_area, spacing * spacing);
                 break;
             case ipGrid:
@@ -596,10 +736,16 @@ coordf_t Layer::get_sparse_infill_max_void_area()
     return max_void_area;
 }
 
-size_t Layer::get_extruder_id(unsigned int filament_id) const
+size_t Layer::get_filament_config_idx(unsigned int filament_id) const
 {
-    return m_object->print()->get_extruder_id(filament_id);
+    return m_object->print()->get_filament_config_idx(filament_id);
 }
+
+size_t Layer::get_process_config_idx(unsigned int filament_id) const
+{
+    return m_object->print()->get_process_config_idx(filament_id);
+}
+
 
 BoundingBox get_extents(const LayerRegion &layer_region)
 {

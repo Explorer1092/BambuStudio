@@ -17,6 +17,7 @@
 #include <wx/tokenzr.h>
 #include <boost/algorithm/string/predicate.hpp>
 #include "OG_CustomCtrl.hpp"
+#include "ParamTooltip.hpp"
 #include "MsgDialog.hpp"
 #include "BitmapComboBox.hpp"
 
@@ -29,6 +30,9 @@
 #include "Widgets/TextCtrl.h"
 
 #include "../Utils/ColorSpaceConvert.hpp"
+#ifdef __WXGTK3__
+#include <gtk/gtk.h>
+#endif
 #ifdef __WXOSX__
 #define wxOSX true
 #else
@@ -123,43 +127,10 @@ void Field::PostInitialize()
 
 	BUILD();
 
-	// For the mode, when settings are in non-modal dialog, neither dialog nor tabpanel doesn't receive wxEVT_KEY_UP event, when some field is selected.
-	// So, like a workaround check wxEVT_KEY_UP event for the Filed and switch between tabs if Ctrl+(1-4) was pressed
-    if (getWindow()) {
-        if (m_opt.readonly) {
-            this->disable();
-        } else {
-            this->enable();
-        }
-		getWindow()->Bind(wxEVT_KEY_UP, [](wxKeyEvent& evt) {
-		    if ((evt.GetModifiers() & wxMOD_CONTROL) != 0) {
-			    int tab_id = -1;
-			    switch (evt.GetKeyCode()) {
-			    case '1': { tab_id = 0; break; }
-			    case '2': { tab_id = 1; break; }
-				case '3': { tab_id = 2; break; }
-				case '4': { tab_id = 3; break; }
-#ifdef __APPLE__
-				case 'f':
-#else /* __APPLE__ */
-				case WXK_CONTROL_F:
-#endif /* __APPLE__ */
-                case 'F': {
-                    //wxGetApp().plater()->search(false, Preset::TYPE_MODEL, nullptr, nullptr);
-                    break;
-                }
-			    default: break;
-			    }
-			    if (tab_id >= 0)
-					wxGetApp().mainframe->select_tab(tab_id);
-				if (tab_id > 0)
-					// tab panel should be focused for correct navigation between tabs
-				    wxGetApp().tab_panel()->SetFocus();
-		    }
-
-		    evt.Skip();
-	    }, getWindow()->GetId());
-    }
+    if (m_opt.readonly)
+        this->disable();
+    else
+        this->enable();
 }
 
 // Values of width to alignments of fields
@@ -200,23 +171,12 @@ void Field::toggle(bool en) { en && !m_opt.readonly ? enable() : disable(); }
 
 wxString Field::get_tooltip_text(const wxString &default_string)
 {
-	wxString tooltip_text("");
-#ifdef NDEBUG
-	wxString tooltip = _(m_opt.tooltip);
-    edit_tooltip(tooltip);
-
-    std::string opt_id = m_opt_id;
-    auto hash_pos = opt_id.find("#");
-    if (hash_pos != std::string::npos) {
-        opt_id.replace(hash_pos, 1,"[");
-        opt_id += "]";
-    }
-
-	if (tooltip.length() > 0)
-        tooltip_text = tooltip + "\n" +
-        _(L("parameter name")) + "\t: " + opt_id;
- #endif
-	return tooltip_text;
+    // Deliberately empty: by product decision the edit controls carry no native tooltip. The rich
+    // ParamTooltip card shown on the option label is the single source for the parameter
+    // description (and, in developer mode, the opt_key pill), so a second tip on the control would
+    // duplicate it. All the SetToolTip(get_tooltip_text(...)) call sites are kept so the control
+    // tip can be reinstated by returning text here if that decision changes.
+    return wxString();
 }
 
 bool Field::is_matched(const std::string& string, const std::string& pattern)
@@ -259,7 +219,7 @@ void Field::get_value_by_opt_type(wxString& str, const bool check_value/* = true
 			wxString label = m_opt.full_label.empty() ? _(m_opt.label) : _(m_opt.full_label);
             show_error(m_parent, from_u8((boost::format(_utf8(L("%s can't be percentage"))) % into_u8(label)).str()));
 			set_value(double_to_string(m_opt.min), true);
-			m_value = double(m_opt.min);
+			m_value = m_opt.min;
 			break;
 		}
         double val;
@@ -518,6 +478,54 @@ void release_window_pools()
     spools2.clear();
 }
 
+#ifdef __WXGTK3__
+// GtkTextLayout caches the display of one text line and clears that cache only when
+// the line is deleted while the layout is attached to the line's buffer. wxGTK's
+// Freeze() swaps a multiline control's buffer for a temporary one, so a SetValue()
+// while frozen (Tab pages freeze around rebuilds) can free the cached line without
+// telling the layout. The next cursor redraw then reads the freed line. Disabling
+// the main window for a modal ProgressDialog does such a redraw, which crashed
+// MakerWorld "Download and open" in _gtk_text_btree_find_line_top whenever the
+// process Others page, with the multiline post_process field, was selected.
+//
+// Asking GTK for the location of a valid iterator makes the layout rebuild its cache
+// for that line. It replaces a stale entry by comparing pointers only, without
+// dereferencing the freed line. Do this whenever the view changes buffers.
+class MultilineTextCtrl : public wxTextCtrl
+{
+public:
+    using wxTextCtrl::wxTextCtrl;
+
+protected:
+    void DoFreeze() override
+    {
+        wxTextCtrl::DoFreeze();
+        drop_stale_line_display();
+    }
+
+    void DoThaw() override
+    {
+        wxTextCtrl::DoThaw();
+        drop_stale_line_display();
+    }
+
+private:
+    void drop_stale_line_display()
+    {
+        GtkWidget *widget = GetConnectWidget();
+        if (widget == nullptr || !GTK_IS_TEXT_VIEW(widget))
+            return;
+        GtkTextView *view = GTK_TEXT_VIEW(widget);
+        GtkTextIter  start;
+        gtk_text_buffer_get_start_iter(gtk_text_view_get_buffer(view), &start);
+        GdkRectangle location;
+        gtk_text_view_get_iter_location(view, &start, &location);
+    }
+};
+#else
+using MultilineTextCtrl = wxTextCtrl;
+#endif
+
 template<typename T>
 struct Builder
 {
@@ -662,7 +670,7 @@ void TextCtrl::BUILD() {
 
 	// BBS: new param ui style
     // const long style = m_opt.multiline ? wxTE_MULTILINE : wxTE_PROCESS_ENTER/*0*/;
-    static Builder<wxTextCtrl> builder1;
+    static Builder<MultilineTextCtrl> builder1;
     static Builder<::TextInput> builder2;
     auto temp = m_opt.multiline
         ? (wxWindow*)builder1.build(m_parent, wxID_ANY, "", wxDefaultPosition, size, wxTE_MULTILINE)
@@ -1002,17 +1010,17 @@ void SpinCtrl::BUILD() {
 		break;
 	}
 
-    const int min_val = m_opt.min == INT_MIN
+    const int min_val = m_opt.min == ConfigOptionDef::min_default
 #ifdef __WXOSX__
     // We will forcibly set the input value for SpinControl, since the value
     // inserted from the keyboard is not updated under OSX.
     // So, we can't set min control value bigger then 0.
     // Otherwise, it couldn't be possible to input from keyboard value
     // less then min_val.
-    || m_opt.min > 0
+    || m_opt.min > 0.0
 #endif
-    ? 0 : m_opt.min;
-	const int max_val = m_opt.max < 2147483647 ? m_opt.max : 2147483647;
+    ? 0 : (int)std::clamp<double>(m_opt.min, INT_MIN, INT_MAX);
+    const int max_val = (int)std::clamp<double>(m_opt.max, INT_MIN, INT_MAX);
 
     static Builder<SpinInput> builder;
 	auto temp = builder.build(m_parent, "", "", wxDefaultPosition, size,
@@ -1068,7 +1076,7 @@ void SpinCtrl::BUILD() {
         if (!parsed || value < INT_MIN || value > INT_MAX)
             tmp_value = UNDEF_VALUE;
         else {
-            tmp_value = std::min(std::max((int)value, m_opt.min), m_opt.max);
+            tmp_value = (int)std::clamp<double>(std::clamp<double>(value, m_opt.min, m_opt.max), INT_MIN, INT_MAX);
 #ifdef __WXOSX__
 #ifdef UNDEFINED__WXOSX__ // BBS
             // Forcibly set the input value for SpinControl, since the value
@@ -1083,10 +1091,7 @@ void SpinCtrl::BUILD() {
             // update value for the control only if it was changed in respect to the Min/max values
             if (tmp_value != (int)value) {
                 temp->SetValue(tmp_value);
-                // But after SetValue() cursor ison the first position
-                // so put it to the end of string
-                // int pos = std::to_string(tmp_value).length();
-                // temp->SetSelection(pos, pos);
+                temp->GetTextCtrl()->SetInsertionPointEnd();
             }
 #endif
         }
@@ -1110,9 +1115,9 @@ void SpinCtrl::propagate_value()
 	} else {
 #ifdef __WXOSX__
         // check input value for minimum
-        if (m_opt.min > 0 && tmp_value < m_opt.min) {
+        if (m_opt.min > 0.0 && tmp_value < m_opt.min) {
             SpinInput* spin = static_cast<SpinInput*>(window);
-            spin->SetValue(m_opt.min);
+            spin->SetValue((int)std::clamp<double>(m_opt.min, INT_MIN, INT_MAX));
             // spin->GetText()->SetInsertionPointEnd(); // BBS
         }
 #endif
@@ -1129,7 +1134,7 @@ void SpinCtrl::set_value(const boost::any& value, bool change_event) {
     m_disable_change_event = !change_event;
     m_value = value;
     if (value.empty()) { // BBS: null value
-        dynamic_cast<SpinInput*>(window)->SetValue(m_opt.min);
+        dynamic_cast<SpinInput*>(window)->SetValue((int)std::clamp<double>(m_opt.min, INT_MIN, INT_MAX));
         dynamic_cast<SpinInput*>(window)->GetTextCtrl()->SetValue("");
     }
     else {
@@ -1262,6 +1267,9 @@ void Choice::BUILD()
                 } else {
                     temp->Append(_(el));
                 }
+                // Per-value tip shown when hovering this dropdown item
+                const wxString item_tip = ParamTooltip::ItemTooltip(m_opt_id, m_opt.enum_values[i]);
+                if (!item_tip.IsEmpty()) temp->SetItemTooltip(i, item_tip);
                 ++i;
             }
 		}
@@ -1472,9 +1480,17 @@ void Choice::set_value(const boost::any& value, bool change_event)
         if (m_opt_id.compare("host_type") == 0 && val != 0 &&
 			m_opt.enum_values.size() > field->GetCount()) // for case, when PrusaLink isn't used as a HostType
 			val--;
-        if (m_opt_id == "top_surface_pattern" || m_opt_id == "bottom_surface_pattern" || m_opt_id == "internal_solid_infill_pattern" || m_opt_id == "sparse_infill_pattern" ||
-            m_opt_id == "support_style" || m_opt_id == "curr_bed_type" || m_opt_id == "locked_skin_infill_pattern" || m_opt_id == "locked_skeleton_infill_pattern")
+        if (m_opt_id == "top_surface_pattern" || m_opt_id == "bottom_surface_pattern" || m_opt_id == "internal_solid_infill_pattern" || m_opt_id == "sub_top_surface_pattern" || m_opt_id == "sparse_infill_pattern" ||
+            m_opt_id == "support_style" || m_opt_id == "curr_bed_type" || m_opt_id == "locked_skin_infill_pattern" || m_opt_id == "locked_skeleton_infill_pattern" ||
+            m_opt_id == "ironing_pattern" || m_opt_id == "conformal_stagger")
 		{
+            // Dropdown shows Off/Alternate only. Map leftover stagger modes onto those two.
+            if (m_opt_id == "conformal_stagger") {
+                if (val == int(ConformalStagger::HalfStep))
+                    val = int(ConformalStagger::Alternate);
+                else if (val == int(ConformalStagger::Orthogonal))
+                    val = int(ConformalStagger::None);
+            }
 			std::string key;
 			const t_config_enum_values& map_names = *m_opt.enum_keys_map;
 			for (auto it : map_names)
@@ -1560,8 +1576,8 @@ boost::any& Choice::get_value()
 	{
         if (m_opt.nullable && field->GetSelection() == -1)
             m_value = ConfigOptionEnumsGenericNullable::nil_value();
-        else if (m_opt_id == "top_surface_pattern" || m_opt_id == "bottom_surface_pattern" || m_opt_id == "internal_solid_infill_pattern" || m_opt_id == "sparse_infill_pattern" || m_opt_id == "support_style" || m_opt_id == "curr_bed_type" || m_opt_id == "locked_skin_infill_pattern" ||
-                 m_opt_id == "locked_skeleton_infill_pattern") {
+        else if (m_opt_id == "top_surface_pattern" || m_opt_id == "bottom_surface_pattern" || m_opt_id == "internal_solid_infill_pattern" || m_opt_id == "sub_top_surface_pattern" || m_opt_id == "sparse_infill_pattern" || m_opt_id == "support_style" || m_opt_id == "curr_bed_type" || m_opt_id == "locked_skin_infill_pattern" ||
+                 m_opt_id == "locked_skeleton_infill_pattern" || m_opt_id == "ironing_pattern" || m_opt_id == "conformal_stagger") {
 			const std::string& key = m_opt.enum_values[field->GetSelection()];
 			m_value = int(m_opt.enum_keys_map->at(key));
 		}
@@ -1685,32 +1701,91 @@ void Choice::msw_rescale()
 
 void ColourPicker::BUILD()
 {
-	auto size = wxSize(def_width() * m_em_unit, wxDefaultCoord);
+    auto size = wxSize(def_width_wider() * m_em_unit, wxDefaultCoord);
     if (m_opt.height >= 0) size.SetHeight(m_opt.height*m_em_unit);
     if (m_opt.width >= 0) size.SetWidth(m_opt.width*m_em_unit);
 
-	// Validate the color
-	wxString clr_str(m_opt.type == coString ? m_opt.get_default_value<ConfigOptionString>()->value : m_opt.get_default_value<ConfigOptionStrings>()->get_at(m_opt_idx));
-	wxColour clr(clr_str);
-	if (clr_str.IsEmpty() || !clr.IsOk()) {
-		clr = wxTransparentColour;
-	}
+    // Validate the color
+    wxString clr_str(m_opt.type == coString ? m_opt.get_default_value<ConfigOptionString>()->value : m_opt.get_default_value<ConfigOptionStrings>()->get_at(m_opt_idx));
+    wxColour clr(clr_str);
+    if (clr_str.IsEmpty() || !clr.IsOk()) {
+	    clr = wxTransparentColour;
+    }
 
-	auto temp = new wxColourPickerCtrl(m_parent, wxID_ANY, clr, wxDefaultPosition, size);
+    // create a horizontal sizer with the color picker and a clear button
+    auto sizer = new wxBoxSizer(wxHORIZONTAL);
+    auto panel = new wxPanel(m_parent, wxID_ANY, wxDefaultPosition, size, wxBORDER_NONE);
+    panel->SetSizer(sizer);
+
+    wxSize picker_size = size;
+    picker_size.SetWidth(picker_size.GetWidth() - 30);
+
+	m_color_picker = new wxColourPickerCtrl(panel, wxID_ANY, clr, wxDefaultPosition, picker_size);
     if (parent_is_custom_ctrl && m_opt.height < 0)
-        opt_height = (double)temp->GetSize().GetHeight() / m_em_unit;
-    temp->SetFont(Slic3r::GUI::wxGetApp().normal_font());
-    convert_to_picker_widget(temp);
-    if (!wxOSX) temp->SetBackgroundStyle(wxBG_STYLE_PAINT);
+        opt_height = (double)m_color_picker->GetSize().GetHeight() / m_em_unit;
+    m_color_picker->SetFont(Slic3r::GUI::wxGetApp().normal_font());
+    convert_to_picker_widget(m_color_picker);
+    if (!wxOSX) {
+        m_color_picker->SetBackgroundStyle(wxBG_STYLE_PAINT);
+    }
+	wxGetApp().UpdateDarkUI(m_color_picker);
 
-	wxGetApp().UpdateDarkUI(temp->GetPickerCtrl());
+    // create the clear button
+    m_clear_button = new wxButton(panel, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(25, picker_size.GetHeight()), wxBORDER_NONE);
+    update_clear_button_icon();
+
+    bool has_color = clr.IsOk() && clr != wxTransparentColour;
+    m_clear_button->Show(has_color);
+
+    sizer->Add(m_color_picker, 1, wxEXPAND | (has_color ? wxRIGHT : 0), has_color ? 5 : 0);
+    sizer->Add(m_clear_button, 0, wxALIGN_CENTER_VERTICAL);
+
+    sizer->Layout();
+    panel->Fit();
 
 	// 	// recast as a wxWindow to fit the calling convention
-	window = dynamic_cast<wxWindow*>(temp);
+    window = dynamic_cast<wxWindow *>(panel);
 
-	temp->Bind(wxEVT_COLOURPICKER_CHANGED, ([this](wxCommandEvent e) { on_change_field(); }), temp->GetId());
+    m_color_picker->Bind(wxEVT_COLOURPICKER_CHANGED, ([this](wxCommandEvent e) {
+        update_clear_button_visibility();
+        on_change_field();
+        }), m_color_picker->GetId());
 
-	temp->SetToolTip(get_tooltip_text(clr_str));
+    m_clear_button->Bind(wxEVT_BUTTON, ([this](wxCommandEvent e) { clear_color(); }), m_clear_button->GetId());
+
+    m_color_picker->SetToolTip(get_tooltip_text(clr_str));
+}
+
+void ColourPicker::clear_color()
+{
+    m_color_picker->SetColour(wxTransparentColour);
+    set_undef_value(m_color_picker);
+    update_clear_button_visibility();
+    on_change_field();
+}
+
+void ColourPicker::update_clear_button_visibility()
+{
+    wxColour current_color = m_color_picker->GetColour();
+    bool has_color = current_color.IsOk() && current_color != wxTransparentColour;
+
+    if (m_clear_button->IsShown() != has_color) {
+        m_clear_button->Show(has_color);
+
+        wxSizer *sizer = window->GetSizer();
+        if (sizer) {
+            wxSizerItem *item = sizer->GetItem(static_cast<size_t>(0));
+            // resize the color picker to occupy the freed space
+            if (item) {
+                item->SetFlag(wxEXPAND | (has_color ? wxRIGHT : 0));
+                item->SetBorder(has_color ? 5 : 0);
+                sizer->Layout();
+                window->GetParent()->Layout();
+            }
+        }
+
+        window->Refresh();
+    }
 }
 
 void ColourPicker::set_undef_value(wxColourPickerCtrl* field)
@@ -1744,21 +1819,21 @@ void ColourPicker::set_value(const boost::any& value, bool change_event)
 {
     m_disable_change_event = !change_event;
     const wxString clr_str(boost::any_cast<wxString>(value));
-    auto field = dynamic_cast<wxColourPickerCtrl*>(window);
 
     wxColour clr(clr_str);
     if (clr_str.IsEmpty() || !clr.IsOk())
-        set_undef_value(field);
+        set_undef_value(m_color_picker);
     else
-        field->SetColour(clr);
+        m_color_picker->SetColour(clr);
 
+    update_clear_button_visibility();
     m_disable_change_event = false;
 }
 
 boost::any& ColourPicker::get_value()
 {
     save_colors_to_config();
-	auto colour = static_cast<wxColourPickerCtrl*>(window)->GetColour();
+    auto colour = m_color_picker->GetColour();
     if (colour == wxTransparentColour)
         m_value = std::string("");
     else {
@@ -1772,29 +1847,65 @@ void ColourPicker::msw_rescale()
 {
     Field::msw_rescale();
 
-	wxColourPickerCtrl* field = dynamic_cast<wxColourPickerCtrl*>(window);
-    auto size = wxSize(def_width() * m_em_unit, wxDefaultCoord);
+    auto size = wxSize(def_width_wider() * m_em_unit, wxDefaultCoord);
     if (m_opt.height >= 0)
         size.SetHeight(m_opt.height * m_em_unit);
     else if (parent_is_custom_ctrl && opt_height > 0)
         size.SetHeight(lround(opt_height * m_em_unit));
     if (m_opt.width >= 0) size.SetWidth(m_opt.width * m_em_unit);
-    if (parent_is_custom_ctrl)
-        field->SetSize(size);
-    else
-        field->SetMinSize(size);
+    if (window) {
+        if (parent_is_custom_ctrl)
+            window->SetSize(size);
+        else
+            window->SetMinSize(size);
 
-    if (field->GetColour() == wxTransparentColour)
-        set_undef_value(field);
+        // recalculate the size of the color picker and clear button
+        wxSize picker_size = size;
+        picker_size.SetWidth(size.GetWidth() - 30);
+
+        if (parent_is_custom_ctrl) {
+            m_color_picker->SetSize(picker_size);
+            m_clear_button->SetSize(wxSize(25, picker_size.GetHeight()));
+        } else {
+            m_color_picker->SetMinSize(picker_size);
+            m_clear_button->SetMinSize(wxSize(25, picker_size.GetHeight()));
+        }
+
+        wxSizer *sizer = window->GetSizer();
+        if (sizer) { sizer->Layout(); }
+        window->Refresh();
+    }
+
+
+    if (m_color_picker->GetColour() == wxTransparentColour)
+        set_undef_value(m_color_picker);
 }
 
 void ColourPicker::sys_color_changed()
 {
 #ifdef _WIN32
-	if (wxWindow* win = this->getWindow())
-		if (wxColourPickerCtrl* picker = dynamic_cast<wxColourPickerCtrl*>(win))
-			wxGetApp().UpdateDarkUI(picker->GetPickerCtrl(), true);
+    if (wxWindow* win = this->getWindow()) {
+        wxGetApp().UpdateDarkUI(win);
+        if (m_color_picker)
+            wxGetApp().UpdateDarkUI(m_color_picker->GetPickerCtrl(), true);
+        if (m_clear_button) {
+            update_clear_button_icon();
+        }
+    }
 #endif
+}
+
+void ColourPicker::update_clear_button_icon()
+{
+    if (m_clear_button) {
+        const std::string icon_name  = wxGetApp().dark_mode() ? "clear_color_dark" : "clear_color_light";
+        wxBitmap new_bitmap = create_scaled_bitmap(icon_name, m_clear_button->GetParent(), 20, false);
+        m_clear_button->SetBitmap(new_bitmap);
+        m_clear_button->SetToolTip(_L("Clear color"));
+        m_clear_button->SetBackgroundColour(*wxWHITE);
+        wxGetApp().UpdateDarkUI(m_clear_button);
+        m_clear_button->Refresh();
+    }
 }
 
 void ColourPicker::on_button_click(wxCommandEvent &event) {
@@ -2040,9 +2151,9 @@ void SliderCtrl::BUILD()
 
 	auto temp = new wxBoxSizer(wxHORIZONTAL);
 
-	auto def_val = m_opt.get_default_value<ConfigOptionInt>()->value;
-	auto min = m_opt.min == INT_MIN ? 0 : m_opt.min;
-	auto max = m_opt.max == INT_MAX ? 100 : m_opt.max;
+	const int def_val = m_opt.get_default_value<ConfigOptionInt>()->value;
+	const int min = m_opt.min == ConfigOptionDef::min_default ? 0 : (int)std::clamp<double>(m_opt.min, INT_MIN, INT_MAX);
+	const int max = m_opt.max == ConfigOptionDef::max_default ? 100 : (int)std::clamp<double>(m_opt.max, INT_MIN, INT_MAX);
 
 	m_slider = new wxSlider(m_parent, wxID_ANY, def_val * m_scale,
 							min * m_scale, max * m_scale,
@@ -2098,5 +2209,227 @@ boost::any& SliderCtrl::get_value()
 	return m_value = int(m_slider->GetValue()/m_scale);
 }
 
+t_field MultiVariantTextCtrl::create_text_ctrl(int opt_index, wxWindow *parent)
+{
+    ConfigOptionDef opt_copy = m_opt;
+    std::string opt_id_with_index = m_opt_id + "#" + std::to_string(opt_index);
+    wxWindow *parent_to_use = parent ? parent : m_parent;
+    auto text_ctrl = TextCtrl::Create<TextCtrl>(parent_to_use, opt_copy, opt_id_with_index);
+    text_ctrl->m_opt_idx = opt_index;
+
+    text_ctrl->m_on_change = [this, opt_id_with_index](const t_config_option_key& key,
+                                                         const boost::any& value) {
+        if (m_on_change && !m_disable_change_event) {
+            m_on_change(opt_id_with_index, value);
+        }
+    };
+
+    text_ctrl->m_on_kill_focus = [this, opt_id_with_index](const std::string& key) {
+        if (m_on_kill_focus) {
+            m_on_kill_focus(opt_id_with_index);
+        }
+    };
+
+    text_ctrl->m_back_to_initial_value = [this, opt_id_with_index](std::string opt_key) {
+        if (m_back_to_initial_value) {
+            m_back_to_initial_value(opt_id_with_index);
+        }
+    };
+
+    text_ctrl->m_back_to_sys_value = [this, opt_id_with_index](std::string opt_key) {
+        if (m_back_to_sys_value) {
+            m_back_to_sys_value(opt_id_with_index);
+        }
+    };
+
+    return text_ctrl;
+}
+
+std::vector<std::pair<int, wxString>> MultiVariantTextCtrl::get_current_layout()
+{
+    std::vector<std::pair<int, wxString>> layout;
+    auto& project_config = m_preset_bundle->project_config;
+    auto nozzle_volumes = project_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
+    int extruder_nums = m_preset_bundle->get_printer_extruder_count();
+
+    for (int i = 0; i < extruder_nums; ++i) {
+        NozzleVolumeType volume_type = NozzleVolumeType(nozzle_volumes->values[i]);
+        if (volume_type == NozzleVolumeType::nvtHybrid) {
+            int standard_index = get_index_for_extruder(i, NozzleVolumeType::nvtStandard);
+            int highflow_index = get_index_for_extruder(i, NozzleVolumeType::nvtHighFlow);
+            wxString extruder_name = (i == 0) ? _L("L") : _L("R");
+            layout.push_back({standard_index, wxString::Format(_L("%s %s:"), extruder_name, _L("Std"))});
+            layout.push_back({highflow_index, wxString::Format(_L("%s %s:"), extruder_name, _L("HF"))});
+        } else {
+            int index = get_index_for_extruder(i, volume_type);
+            wxString extruder_name = (i == 0) ? _L("L:") : _L("R:");
+            wxString volume_name = DevNozzle::GetNozzleVolumeTypeStr(volume_type);
+            layout.push_back({index, extruder_name});
+        }
+    }
+
+    return layout;
+}
+
+int MultiVariantTextCtrl::get_index_for_extruder(int extruder_id, NozzleVolumeType nozzle_type)
+{
+    auto& printer_config = m_preset_bundle->printers.get_edited_preset().config;
+    auto extruders = printer_config.option<ConfigOptionEnumsGeneric>("extruder_type");
+
+    static std::pair<std::string, std::string> extruder_variant_keys[]{
+        {}, {"print_extruder_id", "print_extruder_variant"},     // Preset::TYPE_PRINT
+        {}, {"", "filament_extruder_variant"},                   // Preset::TYPE_FILAMENT filament don't use id anymore
+        {}, {"printer_extruder_id", "printer_extruder_variant"}, // Preset::TYPE_PRINTER
+    };
+    auto variant_keys = extruder_variant_keys[
+        Preset::TYPE_PRINTER
+    ];
+
+    return printer_config.get_index_for_extruder(
+        extruder_id + 1,
+        variant_keys.first,
+        ExtruderType(extruders->values[extruder_id]),
+        nozzle_type,
+        variant_keys.second
+    );
+}
+
+void MultiVariantTextCtrl::BUILD()
+{
+    m_preset_bundle = wxGetApp().preset_bundle;
+    m_variant_sizer = new wxBoxSizer(wxVERTICAL);
+
+    refresh_text_ctrls_layout();
+}
+
+void MultiVariantTextCtrl::refresh_text_ctrls_layout(wxWindow *parent)
+{
+    auto new_layout   = get_current_layout();
+    bool need_rebuild = (new_layout.size() != m_text_ctrls.size());
+    if (!need_rebuild) {
+        for (size_t i = 0; i < new_layout.size(); ++i) {
+            if (new_layout[i].first != m_text_ctrls[i].opt_index ||
+                new_layout[i].second != m_text_ctrls[i].label_text) {
+                need_rebuild = true;
+                break;
+            }
+        }
+    }
+
+    if (!need_rebuild) return;
+
+    m_variant_sizer->Clear(true);
+    m_text_ctrls.clear();
+    wxWindow *parent_to_use = parent ? parent : m_parent;
+
+    for (auto& [index, label_text] : new_layout) {
+        auto h_sizer = new wxBoxSizer(wxHORIZONTAL);
+        t_field text_ctrl = create_text_ctrl(index, parent_to_use);
+        if (new_layout.size() != 1 && label_text) {
+            auto text_input = dynamic_cast<::TextInput*>(text_ctrl->getWindow());
+            if (text_input) {
+                text_input->SetSize(wxSize(def_width_wider() * m_em_unit + 20, wxDefaultCoord));
+                text_input->SetPrefix(label_text);
+            }
+        }
+        wxWindow* text_window = text_ctrl->getWindow();
+        h_sizer->Add(text_window, 0, wxALIGN_CENTER_VERTICAL);
+        m_variant_sizer->Add(h_sizer, 0, wxEXPAND | wxBOTTOM, 5);
+        m_text_ctrls.push_back(VariantTextCtrl(
+            std::move(text_ctrl), index, label_text));
+    }
+
+    parent_to_use->Layout();
+    set_value(boost::any(), false);
+
+    if (parent_is_custom_ctrl && parent_to_use) {
+        wxWindow *current = parent_to_use;
+        while (current) {
+            if (auto *custom_ctrl = dynamic_cast<OG_CustomCtrl *>(current)) {
+                custom_ctrl->update_line_height_for_field(m_opt_id);
+                break;
+            }
+            current = current->GetParent();
+        }
+    }
+}
+
+void MultiVariantTextCtrl::set_value(const boost::any& value, bool change_event)
+{
+    m_disable_change_event = !change_event;
+
+    auto vec_opt = dynamic_cast<ConfigOptionVectorBase*>(
+        m_preset_bundle->prints.get_edited_preset().config.option(m_opt.opt_key));
+
+    if (!vec_opt) {
+        m_disable_change_event = false;
+        return;
+    }
+
+    for (auto& ctrl : m_text_ctrls) {
+        if (ctrl.opt_index >= 0 && ctrl.opt_index < vec_opt->size()) {
+            if (m_opt.type == coFloats || m_opt.type == coPercents) {
+                auto floats = dynamic_cast<ConfigOptionFloatsNullable*>(vec_opt);
+                ctrl.text_ctrl->set_value(
+                    double_to_string(floats->get_at(ctrl.opt_index)), false);
+            } else if (m_opt.type == coInts) {
+                auto ints = dynamic_cast<ConfigOptionInts*>(vec_opt);
+                ctrl.text_ctrl->set_value(
+                    wxString::Format("%d", ints->get_at(ctrl.opt_index)), false);
+            }
+        }
+    }
+
+    m_disable_change_event = false;
+}
+
+boost::any& MultiVariantTextCtrl::get_value()
+{
+    std::vector<std::string> values;
+    for (auto& ctrl : m_text_ctrls) {
+        auto& val = ctrl.text_ctrl->get_value();
+        if (!val.empty()) {
+            if (m_opt.type == coFloats || m_opt.type == coPercents) {
+                values.push_back(std::to_string(boost::any_cast<double>(val)));
+            } else if (m_opt.type == coInts) {
+                values.push_back(std::to_string(boost::any_cast<int>(val)));
+            } else {
+                values.push_back(boost::any_cast<std::string>(val));
+            }
+        }
+    }
+    m_value = values;
+    return m_value;
+}
+
+void MultiVariantTextCtrl::enable()
+{
+    for (auto& ctrl : m_text_ctrls) {
+        ctrl.text_ctrl->enable();
+    }
+}
+
+void MultiVariantTextCtrl::disable()
+{
+    for (auto& ctrl : m_text_ctrls) {
+        ctrl.text_ctrl->disable();
+    }
+}
+
+void MultiVariantTextCtrl::msw_rescale()
+{
+    Field::msw_rescale();
+
+    for (auto& ctrl : m_text_ctrls) {
+        auto win = ctrl.text_ctrl->getWindow();
+        int current_width = win->GetSize().GetWidth();
+        ctrl.text_ctrl->msw_rescale();
+        win->SetSize(current_width, win->GetSize().GetHeight());
+    }
+
+    if (m_parent) {
+        m_parent->Layout();
+    }
+}
 
 }} // Slic3r

@@ -9,6 +9,7 @@
 
 #include "slic3r/GUI/GUI.hpp"
 #include "slic3r/GUI/I18N.hpp"
+#include "libslic3r/Log.hpp"
 
 namespace Slic3r { namespace GUI {
 
@@ -62,7 +63,9 @@ class PlaterWorker: public Worker {
 
             } wctl{c};
 
-            CursorSetterRAII busycursor{wctl};
+            if (m_job->show_busy_cursor()) {
+                CursorSetterRAII busycursor{ wctl };
+            }
 
             using namespace std::chrono;
             steady_clock::time_point process_start = steady_clock::now();
@@ -88,7 +91,7 @@ class PlaterWorker: public Worker {
             if (eptr) try {
                 std::rethrow_exception(eptr);
             }  catch (std::exception &e) {
-                show_error(m_plater, _L("An unexpected error occured") + ": " + e.what());
+                show_error(m_plater, _L("An unexpected error occurred") + ": " + e.what());
                 eptr = nullptr;
             }
         }

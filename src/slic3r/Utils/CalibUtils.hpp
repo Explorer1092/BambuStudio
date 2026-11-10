@@ -1,5 +1,6 @@
 #pragma once
 #include "libslic3r/Calib.hpp"
+#include "../GUI/Widgets/ComboBox.hpp"
 #include "../GUI/DeviceManager.hpp"
 #include "../GUI/Jobs/PrintJob.hpp"
 
@@ -19,7 +20,9 @@ public:
     int                                extruder_id = 0;
     int                                ams_id = 0;
     int                                slot_id = 0;
-    float                              nozzle_diameter;
+    float                              nozzle_diameter = -1.f;
+    int                                nozzle_pos_id = -1;  //-1 means no nozzle pos;   0:right extruder, 1:left extruder, 0x10~0x15: nozzle pos
+    std::string                        nozzle_sn;
     ExtruderType                       extruder_type{ExtruderType::etDirectDrive};
     NozzleVolumeType                   nozzle_volume_type;
     Calib_Params                       params;
@@ -58,7 +61,7 @@ public:
     static bool get_flow_ratio_calib_results(std::vector<FlowRatioCalibResult> &flow_ratio_calib_results);
     static bool calib_flowrate(int pass, const CalibInfo &calib_info, wxString &error_message);
 
-    static void calib_pa_pattern(const CalibInfo &calib_info, Model &model);
+    static void calib_pa_pattern(const MachineObject *obj, const CalibInfo &calib_info, Model &model, DynamicPrintConfig &full_config);
 
     static void set_for_auto_pa_model_and_config(const std::vector<CalibInfo> &calib_info, DynamicPrintConfig &full_config, Model &model);
 
@@ -72,8 +75,19 @@ public:
     //help function
     static bool is_support_auto_pa_cali(std::string filament_id);
 
+    // Get all supported nozzle diameters for a given printer model
+    static std::vector<std::string> get_supported_nozzle_diameters_by_model(const MachineObject *obj);
+
+    // Get all supported NozzleVolumeTypes for a given printer model and nozzle diameter
+    static std::vector<NozzleVolumeType> get_supported_nozzle_volume_types_by_model_and_nozzle(const MachineObject *obj, const std::string &nozzle_diameter);
+
+    // key:supported volume type; value: volume type supported diameter
+    static std::map<NozzleVolumeType, std::set<NozzleDiameterType>> get_supported_nozzle_volume_and_diameters(const MachineObject *obj, bool with_hybrid=true);
+
     static int get_selected_calib_idx(const std::vector<PACalibResult> &pa_calib_values, int cali_idx);
     static bool get_pa_k_n_value_by_cali_idx(const MachineObject* obj, int cali_idx, float& out_k, float& out_n);
+
+    static ExtruderType get_extruder_type(const MachineObject* obj, int extruder_id);
 
     static bool validate_input_name(wxString name);
     static bool validate_input_k_value(wxString k_text, float* output_value);
@@ -82,6 +96,12 @@ public:
     static bool check_printable_status_before_cali(const MachineObject *obj, const X1CCalibInfos &cali_infos, wxString &error_message);
     static bool check_printable_status_before_cali(const MachineObject *obj, const CalibInfo &cali_info, wxString &error_message);
     static bool check_printable_status_before_cali(const MachineObject *obj, const std::vector<CalibInfo> &cali_infos, wxString &error_message);
+
+    static bool check_tpu_volume_type_before_cali(const CalibMode& cali_mode, const std::vector<CalibInfo> &cali_infos, wxString& error_message);
+    static bool check_tpu_volume_type_before_cali(const CalibMode& cali_mode, const X1CCalibInfos& cali_infos, wxString& error_message);
+
+    // Build filament/AMS map for the calibration pages.
+    static std::map<int, DynamicPrintConfig> build_filament_ams_list(MachineObject* obj);
 
 private:
     static bool process_and_store_3mf(Model* model, const DynamicPrintConfig& full_config, const Calib_Params& params, wxString& error_message);
@@ -94,6 +114,34 @@ extern void get_tray_ams_and_slot_id(MachineObject* obj, int in_tray_id, int &am
 extern void get_default_k_n_value(const std::string &filament_id, float &k, float &n);
 extern wxString get_nozzle_volume_type_name(NozzleVolumeType type);
 extern bool     is_pa_params_valid(const Calib_Params &params);
+
+extern void update_speed_parameter(const std::string &key);
+extern std::vector<double> generate_max_speed_parameter_value(const std::string &key);
+template<typename T>
+inline bool switch_combox_to_target(ComboBox* combox, const T& target)
+{
+    for (unsigned int i = 0; i < combox->GetCount(); i++) {
+        if (combox->GetClientData(i) != nullptr && target == T(*(int*)combox->GetClientData(i))) {
+            combox->SetSelection(i);
+            return true;
+        }
+    }
+    combox->SetSelection(-1);
+    return false;
+}
+
+/* Read the enum value attached as ClientData(int*) on the currently selected
+   item. Returns `fallback` when combox is null, no item is selected, or
+   ClientData is missing. */
+template<typename T>
+inline T get_combox_selected_value(const ComboBox* combox, T fallback)
+{
+    if (!combox) return fallback;
+    int sel = combox->GetSelection();
+    if (sel == wxNOT_FOUND) return fallback;
+    int* data = reinterpret_cast<int*>(combox->GetClientData(sel));
+    return data ? static_cast<T>(*data) : fallback;
+}
 
 
 }

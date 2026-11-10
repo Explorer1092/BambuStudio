@@ -1,5 +1,6 @@
 #pragma once
 #include <optional>
+#include <string_view>
 #include "libslic3r/CommonDefs.hpp"
 
 #include "slic3r/Utils/json_diff.hpp"
@@ -12,6 +13,7 @@ namespace Slic3r
 
 //Previous definitions
 class MachineObject;
+class DevExtder;
 class DevExtderSystem;
 
 struct DevAmsSlotInfo
@@ -20,6 +22,7 @@ struct DevAmsSlotInfo
     std::string slot_id;
 
 public:
+    bool operator!=(const DevAmsSlotInfo& other) const { return !(*this == other); }
     bool operator==(const DevAmsSlotInfo& other) const { return ams_id == other.ams_id && slot_id == other.slot_id;}
 };
 
@@ -30,6 +33,28 @@ enum DevExtderSwitchState
     ES_SWITCHING,
     ES_SWITCHING_FAILED
 };
+
+enum class DevExtrusionDirection : int
+{
+    Unknown = -1,
+    Idle = 0,
+    Extruding = 1,
+    Retracting = 2
+};
+
+enum class DevRackExtruderVisualState : int
+{
+    Empty,
+    Clamped,
+    ClampedRetracting,
+    ClampedExtruding,
+    Picking,
+    Placing,
+    ClampedNoFilament
+};
+DevExtrusionDirection decode_extrusion_direction(unsigned int info);
+DevRackExtruderVisualState resolve_rack_extruder_visual_state(MachineObject* obj, const DevExtder& extruder);
+std::string_view rack_extruder_visual_state_key(DevRackExtruderVisualState state);// Stable key used to look the images in the machine's "rack_extruder_images" config.
 
 class DevExtder
 {
@@ -47,13 +72,16 @@ public:
     wxString GetDisplayName() const;
 
     // installed nozzle info
-    bool           HasNozzleInstalled() const = delete;//{ return m_has_nozzle; }
+    bool           HasNozzleInstalled() const  { return m_has_nozzle; }
 
     int            GetNozzleId() const { return m_current_nozzle_id; }
     int            GetTargetNozzleId() const = delete;//{ return m_target_nozzle_id; }
     NozzleType     GetNozzleType()     const;
     NozzleFlowType GetNozzleFlowType() const;
     float          GetNozzleDiameter() const;
+    NozzleDiameterType GetNozzleDiameterType() const;
+
+    std::optional<int> GetPickedNozzleAddrId() const;
 
     // temperature
     int  GetCurrentTemp() const { return m_cur_temp; }
@@ -61,14 +89,25 @@ public:
 
     // filament
     bool             HasFilamentInExt() const { return m_ext_has_filament; }
-    bool             HasFilamentInBuffer() const = delete; //{ return m_buffer_has_filament; }  
+    DevExtrusionDirection GetExtrusionDirection() const { return m_extrusion_direction; }
+    bool             HasFilamentInBuffer() const = delete; //{ return m_buffer_has_filament; }
     bool             HasFilamBackup() const { return !m_filam_bak.empty(); }
     std::vector<int> GetFilamBackup() const { return m_filam_bak; }
+    std::vector<std::vector<DevAmsSlotId>> GetBackupSlots() const;
+    std::optional<DevFilamentStep> GetCurrentFilamentChangeStep() const { return m_current_filament_change_step; }
 
     // ams binding on current extruder
     const DevAmsSlotInfo& GetSlotPre() const { return m_spre; }
     const DevAmsSlotInfo& GetSlotNow() const { return m_snow; }
     const DevAmsSlotInfo& GetSlotTarget() const { return m_star; }
+
+    static std::unordered_map<int, bool> GetBackupStatus(unsigned int fila_back_group);
+
+    // extuder type
+    bool             IsBowdenExtuder() const;
+
+    static int to_physical_extruder_id(int total_ext_count, int logical_extruder_id);
+    static int to_logical_extruder_id(int total_ext_count, int physical_extruder_id);
 
 private:
     void SetExtId(int val) { m_ext_id = val; }
@@ -80,7 +119,7 @@ private:
     int m_ext_id; // 0-right 1-left
 
     // current nozzle
-    bool   m_has_nozzle = false;
+    bool   m_has_nozzle = true; // default to true, since A/P/.. series does not support nozzle detecion
     int    m_current_nozzle_id = 0;  // nozzle id now. for some machine, the extruder may have serveral nozzles
     int    m_target_nozzle_id = 0; // target nozzle id
 
@@ -90,6 +129,7 @@ private:
 
     // filament
     bool             m_ext_has_filament = false;
+    DevExtrusionDirection m_extrusion_direction = DevExtrusionDirection::Unknown;
     bool             m_buffer_has_filament = false;
     std::vector<int> m_filam_bak;// the refill filam
 
@@ -100,12 +140,13 @@ private:
 
     int m_ams_stat = 0;
     int m_rfid_stat = 0;
+    std::optional<DevFilamentStep> m_current_filament_change_step;
 };
 
 // ExtderSystem is the extruder management system for the device.
-// It consists of multiple extruders (Extder) and nozzles. 
-// Each extruder can be associated with different nozzles, and the number of extruders 
-// does not necessarily equal the number of nozzles. 
+// It consists of multiple extruders (Extder) and nozzles.
+// Each extruder can be associated with different nozzles, and the number of extruders
+// does not necessarily equal the number of nozzles.
 // Note: The IDs of extruders and nozzles may not match or correspond one-to-one.
 class DevExtderSystem
 {
@@ -140,11 +181,12 @@ public:
     const std::vector<DevExtder>&  GetExtruders() const { return m_extders;};
 
     // get nozzle info which is installed on the extruder
-    NozzleType     GetNozzleType(int extder_id)     const { return GetExtderById(extder_id) ? GetExtderById(extder_id)->GetNozzleType() : NozzleType::ntUndefine; }
-    NozzleFlowType GetNozzleFlowType(int extder_id) const { return GetExtderById(extder_id) ? GetExtderById(extder_id)->GetNozzleFlowType() : NozzleFlowType::NONE_FLOWTYPE;; }
-    float          GetNozzleDiameter(int extder_id) const { return GetExtderById(extder_id) ? GetExtderById(extder_id)->GetNozzleDiameter() : 0.0; }
-    int            GetNozzleTempCurrent(int extder_id) const { return GetExtderById(extder_id) ? GetExtderById(extder_id)->GetCurrentTemp() : 0; }
-    int            GetNozzleTempTarget(int extder_id) const { return GetExtderById(extder_id) ? GetExtderById(extder_id)->GetTargetTemp() : 0; }
+    NozzleType          GetNozzleType(int extder_id)     const { return GetExtderById(extder_id) ? GetExtderById(extder_id)->GetNozzleType() : NozzleType::ntUndefine; }
+    NozzleFlowType      GetNozzleFlowType(int extder_id) const { return GetExtderById(extder_id) ? GetExtderById(extder_id)->GetNozzleFlowType() : NozzleFlowType::NONE_FLOWTYPE; }
+    NozzleDiameterType  GetNozzleDiameterType(int extder_id) const { return GetExtderById(extder_id) ? GetExtderById(extder_id)->GetNozzleDiameterType() : NozzleDiameterType::NONE_DIAMETER_TYPE; }
+    float               GetNozzleDiameter(int extder_id) const { return GetExtderById(extder_id) ? GetExtderById(extder_id)->GetNozzleDiameter() : 0.0; }
+    int                 GetNozzleTempCurrent(int extder_id) const { return GetExtderById(extder_id) ? GetExtderById(extder_id)->GetCurrentTemp() : 0; }
+    int                 GetNozzleTempTarget(int extder_id) const { return GetExtderById(extder_id) ? GetExtderById(extder_id)->GetTargetTemp() : 0; }
 
     // get slot info which is connected to the extruder
     std::string GetCurrentAmsId() const;
@@ -154,9 +196,12 @@ public:
 
     // filament
     bool IsBusyLoading() const { return m_current_busy_for_loading; }
-    int  GetLoadingExtderId() const { return m_current_loading_extder_id; }
+    std::optional<int>  GetLoadingExtderId() const { return m_current_loading_extder_id; }
     bool HasFilamentBackup() const;
     bool HasFilamentInExt(int exter_id) { return GetExtderById(exter_id) ? GetExtderById(exter_id)->HasFilamentInExt() : false; }
+
+    // filament backup
+    std::vector<DevAmsSlotId> GetBackupAmsSlotInGroup(const DevAmsSlotId& ams_slot_id); // query other ams_slot_id in same group
 
 protected:
     void  AddExtder(const DevExtder& ext) { m_extders[ext.GetExtId()] = ext; };
@@ -177,7 +222,7 @@ private:
 
     // loading extruder
     bool m_current_busy_for_loading{ false };
-    int m_current_loading_extder_id = INVALID_EXTRUDER_ID;
+    std::optional<int> m_current_loading_extder_id;
 };
 
 class ExtderSystemParser

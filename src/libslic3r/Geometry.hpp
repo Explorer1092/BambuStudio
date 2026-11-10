@@ -118,8 +118,8 @@ inline bool segments_intersect(
 	const Slic3r::Point &ip1, const Slic3r::Point &ip2,
 	const Slic3r::Point &jp1, const Slic3r::Point &jp2)
 {
-    assert(ip1 != ip2);
-    assert(jp1 != jp2);
+    //assert(ip1 != ip2);
+    //assert(jp1 != jp2);
 
     auto segments_could_intersect = [](
         const Slic3r::Point &ip1, const Slic3r::Point &ip2,
@@ -372,6 +372,25 @@ void scale_transform(Transform3d &transform, const Vec3d &scale);
 // Returns the transform obtained by assembling the given scale factors
 Transform3d scale_transform(double scale);
 Transform3d scale_transform(const Vec3d &scale);
+
+// Returns the world-space unit normal of a surface whose local normal is normal, for a body
+// placed by transform. Returns zero when the transformed normal degenerates.
+//
+// Normals do not transform like directions: they need the inverse transpose of the linear
+// part. Using the linear part itself tilts them on a non-uniformly scaled body, which a
+// uniform scale hides because there it only changes the length, not the direction.
+inline Vec3d transform_normal(const Transform3d &transform, const Vec3d &normal)
+{
+    const Vec3d  n   = transform.linear().inverse().transpose() * normal;
+    const double len = n.norm();
+    return (len < EPSILON) ? Vec3d::Zero() : Vec3d(n / len);
+}
+// Explicit Vec3d: Eigen's cast<>() expression converts to both Vec3d and Vec3f, which MSVC
+// treats as an ambiguous overload (C2668).
+inline Vec3d transform_normal(const Transform3d &transform, const Vec3f &normal)
+{
+    return transform_normal(transform, Vec3d(normal.cast<double>()));
+}
 
 class Transformation
 {

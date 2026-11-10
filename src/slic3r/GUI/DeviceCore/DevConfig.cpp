@@ -8,16 +8,30 @@ using namespace nlohmann;
 namespace Slic3r
 {
 
+bool DevConfig::SupportChamberTempDisplay() const
+{
+    if (!m_support_chamber_temp_display.has_value()) {
+        return m_has_chamber;
+    }
+
+    return m_support_chamber_temp_display.value();
+}
+
 void DevConfig::ParseConfig(const json& print_json)
 {
     ParseChamberConfig(print_json);
     ParsePrintOptionsConfig(print_json);
     ParseCalibrationConfig(print_json);
-
 }
 
 void DevConfig::ParseChamberConfig(const json& print_json)
 {
+    DevJsonValParser::ParseVal(print_json, "support_chamber", m_has_chamber);
+
+    if (print_json.contains("support_chamber_temp_display")) {
+        m_support_chamber_temp_display = DevJsonValParser::GetVal<bool>(print_json, "support_chamber_temp_display");
+    }
+
     DevJsonValParser::ParseVal(print_json, "support_chamber_temp_edit", m_support_chamber_edit);
     if (m_support_chamber_edit)
     {
@@ -41,6 +55,9 @@ void DevConfig::ParsePrintOptionsConfig(const json& print_json)
     DevJsonValParser::ParseVal(print_json, "support_ai_monitoring", m_support_ai_monitor);
     DevJsonValParser::ParseVal(print_json, "support_print_without_sd", m_support_print_without_sd);
     DevJsonValParser::ParseVal(print_json, "support_print_all", m_support_print_all);
+    DevJsonValParser::ParseVal(print_json, "support_fdm_cut_mode_compat", m_support_fdm_cut_mode_compat);
+    DevJsonValParser::ParseVal(print_json, "support_filament_remain_edit", m_support_filament_remain_edit);
+    DevJsonValParser::ParseVal(print_json, "support_filament_remain_edit_rfid", m_support_filament_remain_edit_rfid);
 }
 
 void DevConfig::ParseCalibrationConfig(const json& print_json)
@@ -48,7 +65,11 @@ void DevConfig::ParseCalibrationConfig(const json& print_json)
     DevJsonValParser::ParseVal(print_json, "support_lidar_calibration", m_support_calibration_lidar);
     DevJsonValParser::ParseVal(print_json, "support_nozzle_offset_calibration", m_support_calibration_nozzle_offset);
     DevJsonValParser::ParseVal(print_json, "support_high_tempbed_calibration", m_support_calibration_high_temp_bed);
+    DevJsonValParser::ParseVal(print_json, "support_high_tempbed_calibration_unload_tips", m_support_calibration_high_temp_bed_unload_tips, false);
     DevJsonValParser::ParseVal(print_json, "support_auto_flow_calibration", m_support_calibration_pa_flow_auto);
+    DevJsonValParser::ParseVal(print_json, "support_clump_position_calibration", m_support_calibration_clump_pos);
+    DevJsonValParser::ParseVal(print_json, "support_nozzle_pos_to_nozzle_addr", m_support_nozzle_pos_to_nozzle_addr);
+    DevJsonValParser::ParseVal(print_json, "support_multi_diameter_calibration", m_support_multi_diameter_calibration);
 }
 
 }

@@ -89,6 +89,7 @@ private:
     std::string m_model_filename;
     // Print volume bounding box exteded with axes and model.
     BoundingBoxf3 m_extended_bounding_box;
+    BoundingBoxf3 m_printable_bounding_box;
     // Slightly expanded print bed polygon, for collision detection.
     //Polygon m_polygon;
     GLModel m_triangles;
@@ -135,6 +136,7 @@ public:
 
     // Bounding box around the print bed, axes and model, for rendering.
     const BoundingBoxf3& extended_bounding_box() const { return m_extended_bounding_box; }
+    const BoundingBoxf3 &printable_bounding_box() const { return m_printable_bounding_box; }
     BoundingBoxf3 get_cur_bed_model_box();
     const std::string &  get_model_filename() { return m_model_filename; }
     const GLModel &      get_model() { return m_model; }
@@ -151,7 +153,8 @@ public:
 private:
     //BBS: add partplate related logic
     // Calculate an extended bounding box from axes and current model for visualization purposes.
-    BoundingBoxf3 calc_extended_bounding_box(bool consider_model_offset = true) const;
+    BoundingBoxf3 calc_printable_bounding_box() const;
+    BoundingBoxf3 calc_extended_bounding_box() const;
     void calc_triangles(const ExPolygon& poly);
     void calc_gridlines(const ExPolygon& poly, const BoundingBox& bed_bbox);
     void update_model_offset() const;
@@ -167,6 +170,36 @@ private:
     void render_custom(GLCanvas3D& canvas, bool bottom);
     void render_default(bool bottom);
     void release_VBOs();
+};
+
+// Assemble-canvas-only XY ground overlay (not part of the printable bed).
+// Lives next to Bed3D because 3DBed.hpp already hosts related GL render helpers
+// (Axes / bed geometry); consumed by GLCanvas3D::m_world_grid in CanvasAssembleView.
+// Driven by an AABB projected to Z≈0; 10mm cells, every 5th line bolder; extent is
+// snapped/expanded slightly past the XY projection and capped at MaxExtentMm.
+class WorldXYGrid
+{
+public:
+    static constexpr double CellSizeMm  = 10.0;
+    static constexpr double ExpandMm    = 10.0;
+    static constexpr double MaxExtentMm = 500.0;
+
+    // Rebuild geometry when the projected/expanded XY box changes.
+    void set_from_aabb(const BoundingBoxf3 &aabb);
+    void set_dark(bool is_dark) { m_is_dark = is_dark; }
+    void set_scale_factor(float scale_factor) { m_scale_factor = scale_factor; }
+    void render();
+    bool empty() const { return !m_valid; }
+
+private:
+    void update_geometry(const BoundingBoxf &xy_mm);
+
+    BoundingBoxf m_xy_bb;
+    bool         m_valid{false};
+    bool         m_is_dark{false};
+    float        m_scale_factor{1.0f};
+    GLModel      m_gridlines;
+    GLModel      m_gridlines_bolder;
 };
 
 } // GUI

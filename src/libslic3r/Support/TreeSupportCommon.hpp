@@ -38,14 +38,24 @@ struct TreeSupportMeshGroupSettings {
         //assert(config.support_material);
         //assert(config.support_material_style == smsTree || config.support_material_style == smsOrganic);
 
-        // Calculate maximum external perimeter width over all printing regions, taking into account the default layer height.
+        // Keep the per-region widths so overhang tips in multi-diameter prints use the clearance of
+        // the region they support instead of inheriting the widest nozzle in the object.
+        // 仅多口径使用，否则会多预计算无用半径的碰撞/避让区
+        const bool per_region_xy_distance = print_object.print()->uses_multiple_nozzle_diameters();
         coordf_t external_perimeter_width = 0.;
         for (size_t region_id = 0; region_id < print_object.num_printing_regions(); ++ region_id) {
             const PrintRegion &region = print_object.printing_region(region_id);
-            external_perimeter_width = std::max<coordf_t>(external_perimeter_width, region.flow(print_object, frExternalPerimeter, config.layer_height).width());
+            const coordf_t width = region.flow(print_object, frExternalPerimeter, config.layer_height).width();
+            external_perimeter_width = std::max<coordf_t>(external_perimeter_width, width);
+            if (per_region_xy_distance)
+                this->support_xy_distance_overhang_per_region.emplace_back(
+                    scaled<coord_t>(std::min(config.support_object_xy_distance.value, 0.5 * width)));
         }
 
-        this->layer_height              = scaled<coord_t>(config.layer_height.value);
+        // The tree grows one object layer per step, and multi-diameter slicing cuts the preset's layer height
+        // into layer_grid_subdivision object layers. Every per-layer increment below is derived from this, so
+        // it has to be the grid step, or the radius growth and branch movement per mm scale with the subdivision.
+        this->layer_height              = scaled<coord_t>(slicing_params.layer_height);
         this->resolution                = scaled<coord_t>(print_config.resolution.value);
         // Arache feature
         this->min_feature_size          = scaled<coord_t>(config.min_feature_size.value);
@@ -61,12 +71,40 @@ struct TreeSupportMeshGroupSettings {
                 config.support_interface_top_layers.value) * this->layer_height :
             0;
         this->support_material_buildplate_only = config.support_on_build_plate_only;
+        this->support_top_distance      = scaled<coord_t>(slicing_params.gap_support_object);
+        // Multi-diameter: the gap follows the nozzle printing the overhang, as in TreeSupport::init_top_z_by_nozzle().
+        // One gap serves the whole object here, so take the largest region gap. It also applies to the fine
+        // regions of the object, so it is capped at 0.2 mm instead of the classic tree's 0.4 mm for 0.8 nozzles.
+        // A zero gap is the soluble interface contract and is never replaced.
+        if (slicing_params.gap_support_object > EPSILON && print_object.print()->uses_multiple_nozzle_diameters()) {
+            static constexpr double max_organic_top_gap = 0.2;
+            double top_gap = 0.;
+            for (size_t region_id = 0; region_id < print_object.num_printing_regions(); ++ region_id) {
+                const PrintRegionConfig &region_config = print_object.printing_region(region_id).config();
+                const double nozzle = std::max(nozzle_diameter_for_filament(print_config, region_config.wall_filament.value),
+                                               nozzle_diameter_for_filament(print_config, region_config.solid_infill_filament.value));
+                top_gap = std::max(top_gap, std::min(double(support_top_z_for_nozzle(nozzle)), max_organic_top_gap));
+            }
+            if (top_gap > EPSILON) {
+                // The collision is built from whole object layers, see TreeModelVolumes.
+                top_gap = std::ceil(top_gap / slicing_params.layer_height - EPSILON) * slicing_params.layer_height;
+                this->support_top_distance = scaled<coord_t>(top_gap);
+            }
+        }
+        this->support_bottom_distance   = scaled<coord_t>(slicing_params.gap_object_support);
         this->support_xy_distance           = scaled<coord_t>(std::max(0.01, config.support_object_xy_distance.value));
+        if (print_config.top_z_overrides_xy_distance)
+            this->support_xy_distance = std::min(this->support_xy_distance, std::max(this->support_top_distance, coord_t(scale_(0.2))));
+        for (coord_t &distance : this->support_xy_distance_overhang_per_region)
+            distance = std::min(distance, this->support_xy_distance);
         this->support_xy_distance_1st_layer = scaled<coord_t>(config.support_object_first_layer_gap.value);
         // Separation of interfaces, it is likely smaller than support_xy_distance.
         this->support_xy_distance_overhang = std::min(this->support_xy_distance, scaled<coord_t>(0.5 * external_perimeter_width));
-        this->support_top_distance      = scaled<coord_t>(slicing_params.gap_support_object);
-        this->support_bottom_distance   = scaled<coord_t>(slicing_params.gap_object_support);
+        if (print_object.print()->uses_multiple_nozzle_diameters() &&
+            ! this->support_xy_distance_overhang_per_region.empty())
+            this->support_xy_distance_overhang = *std::min_element(
+                this->support_xy_distance_overhang_per_region.begin(),
+                this->support_xy_distance_overhang_per_region.end());
         this->support_roof_enable       = config.support_interface_top_layers.value > 0;
         this->support_roof_layers       = config.support_interface_top_layers.value;
         this->support_floor_enable      = config.support_interface_bottom_layers.value > 0;
@@ -76,7 +114,6 @@ struct TreeSupportMeshGroupSettings {
         this->support_wall_count        = std::max(1, config.tree_support_wall_count.value);  // at least 1 wall for organic tree support
         this->support_roof_line_distance = scaled<coord_t>(config.support_interface_spacing.value) + this->support_roof_line_width;
         double support_tree_angle_slow = 25;// TODO add a setting?
-        double tree_support_tip_diameter = 0.8;
     	this->support_tree_branch_distance = scaled<coord_t>(config.tree_support_branch_distance.value);
         this->support_tree_angle          = std::clamp<double>(config.tree_support_branch_angle * M_PI / 180., 0., 0.5 * M_PI - EPSILON);
         this->support_tree_angle_slow     = std::clamp<double>(support_tree_angle_slow * M_PI / 180., 0., this->support_tree_angle - EPSILON);
@@ -84,7 +121,12 @@ struct TreeSupportMeshGroupSettings {
         this->support_tree_branch_diameter_angle  = std::clamp<double>(config.tree_support_branch_diameter_angle * M_PI / 180., 0., 0.5 * M_PI - EPSILON);
         this->support_tree_top_rate = 30; // percent
     //    this->support_tree_tip_diameter = this->support_line_width;
-        this->support_tree_tip_diameter = std::clamp(scaled<coord_t>(tree_support_tip_diameter), 0, this->support_tree_branch_diameter);
+        // A branch may not start thinner than a single extrusion, or the tip layers degenerate into a
+        // circle too small to be walled, and it may not start thicker than the branch it grows into.
+        // max() on the upper bound keeps std::clamp well defined when the branch is thinner than a line.
+        this->support_tree_tip_diameter = std::clamp(scaled<coord_t>(config.tree_support_tip_diameter.value),
+                                                     this->support_line_width,
+                                                     std::max(this->support_line_width, this->support_tree_branch_diameter));
     }
 
 /*********************************************************************/
@@ -92,12 +134,12 @@ struct TreeSupportMeshGroupSettings {
 /*********************************************************************/
     coord_t                         layer_height                            { scaled<coord_t>(0.15) };
     // Maximum Deviation (meshfix_maximum_deviation)
-    // The maximum deviation allowed when reducing the resolution for the Maximum Resolution setting. If you increase this, 
-    // the print will be less accurate, but the g-code will be smaller. Maximum Deviation is a limit for Maximum Resolution, 
+    // The maximum deviation allowed when reducing the resolution for the Maximum Resolution setting. If you increase this,
+    // the print will be less accurate, but the g-code will be smaller. Maximum Deviation is a limit for Maximum Resolution,
     // so if the two conflict the Maximum Deviation will always be held true.
     coord_t                         resolution                              { scaled<coord_t>(0.025) };
     // Minimum Feature Size (aka minimum line width) - Arachne specific
-    // Minimum thickness of thin features. Model features that are thinner than this value will not be printed, while features thicker 
+    // Minimum thickness of thin features. Model features that are thinner than this value will not be printed, while features thicker
     // than the Minimum Feature Size will be widened to the Minimum Wall Line Width.
     coord_t                         min_feature_size                        { scaled<coord_t>(0.1) };
 
@@ -129,6 +171,7 @@ struct TreeSupportMeshGroupSettings {
     // Distance of the support structure from the overhang in the X/Y directions.
     // minimum_value: 0,  minimum warning": support_xy_distance - support_line_width * 2, maximum warning: support_xy_distance
     coord_t                         support_xy_distance_overhang            { scaled<coord_t>(0.2) };
+    std::vector<coord_t>            support_xy_distance_overhang_per_region;
     // Support Top Distance
     // Distance from the top of the support to the print.
     coord_t                         support_top_distance                    { scaled<coord_t>(0.1) };
@@ -136,12 +179,12 @@ struct TreeSupportMeshGroupSettings {
     // Distance from the print to the bottom of the support.
     coord_t                         support_bottom_distance                 { scaled<coord_t>(0.1) };
     //FIXME likely not needed, optimization for clipping of interface layers
-    // When checking where there's model above and below the support, take steps of the given height. Lower values will slice slower, while higher values 
+    // When checking where there's model above and below the support, take steps of the given height. Lower values will slice slower, while higher values
     // may cause normal support to be printed in some places where there should have been support interface.
     coord_t                         support_interface_skip_height           { scaled<coord_t>(0.3) };
     // Support Infill Line Directions
-    // A list of integer line directions to use. Elements from the list are used sequentially as the layers progress and when the end 
-    // of the list is reached, it starts at the beginning again. The list items are separated by commas and the whole list is contained 
+    // A list of integer line directions to use. Elements from the list are used sequentially as the layers progress and when the end
+    // of the list is reached, it starts at the beginning again. The list items are separated by commas and the whole list is contained
     // in square brackets. Default is an empty list which means use the default angle 0 degrees.
 //    std::vector<double>             support_infill_angles                   {};
     // Enable Support Roof
@@ -156,7 +199,7 @@ struct TreeSupportMeshGroupSettings {
     // Minimum Support Roof Area
     // Minimum area size for the roofs of the support. Polygons which have an area smaller than this value will be printed as normal support.
     double                          minimum_roof_area                       { scaled<double>(scaled<double>(1.)) };
-    // A list of integer line directions to use. Elements from the list are used sequentially as the layers progress 
+    // A list of integer line directions to use. Elements from the list are used sequentially as the layers progress
     // and when the end of the list is reached, it starts at the beginning again. The list items are separated
     // by commas and the whole list is contained in square brackets. Default is an empty list which means
     // use the default angles (alternates between 45 and 135 degrees if interfaces are quite thick or 90 degrees).
@@ -171,7 +214,7 @@ struct TreeSupportMeshGroupSettings {
     // Amount of offset applied to the floors of the support.
     coord_t                         support_bottom_offset                   { scaled<coord_t>(0.) };
     // Support Wall Line Count
-    // The number of walls with which to surround support infill. Adding a wall can make support print more reliably 
+    // The number of walls with which to surround support infill. Adding a wall can make support print more reliably
     // and can support overhangs better, but increases print time and material used.
     // tree: 1, zig-zag: 0, concentric: 1
     int                             support_wall_count                      { 1 };
@@ -197,12 +240,12 @@ struct TreeSupportMeshGroupSettings {
     // minimum: 0, minimum warning: 20, maximum: 89, maximum warning": 85
     double                          support_tree_angle                      { 60. * M_PI / 180. };
     // Tree Support Branch Diameter Angle
-    // The angle of the branches' diameter as they gradually become thicker towards the bottom. An angle of 0 will cause the branches to have uniform thickness over their length. 
+    // The angle of the branches' diameter as they gradually become thicker towards the bottom. An angle of 0 will cause the branches to have uniform thickness over their length.
     // A bit of an angle can increase stability of the tree support.
     // minimum: 0, maximum: 89.9999, maximum warning: 15
     double                          support_tree_branch_diameter_angle      { 5.  * M_PI / 180. };
     // Tree Support Branch Distance
-    // How far apart the branches need to be when they touch the model. Making this distance small will cause 
+    // How far apart the branches need to be when they touch the model. Making this distance small will cause
     // the tree support to touch the model at more points, causing better overhang but making support harder to remove.
     coord_t                         support_tree_branch_distance            { scaled<coord_t>(1.) };
     // Tree Support Branch Diameter
@@ -227,8 +270,11 @@ struct TreeSupportMeshGroupSettings {
     // How tall a branch has to be if it is placed on the model. Prevents small blobs of support. This setting is ignored when a branch is supporting a support roof.
     // minimum: 0, maximum warning: 5
     coord_t                         support_tree_min_height_to_model        { scaled<coord_t>(1.0) };
-    // Tree Support Inital Layer Diameter
-    // Diameter every branch tries to achieve when reaching the buildplate. Improves bed adhesion.
+    // Tree Support Initial Layer Diameter
+    // Plate-foot cap diameter; the cap radius is this value / 2. NOTE: not wired to the
+    // process config in this build - the ctor never assigns it, so it stays at the
+    // hard-coded 7.5mm diameter (cap radius 3.75mm), not a user setting. Branches already
+    // wider than that are not expanded.
     // minimum: 0, maximum warning: 20
     coord_t                         support_tree_bp_diameter                { scaled<coord_t>(7.5) };
     // Tree Support Branch Density
@@ -272,6 +318,9 @@ struct TreeSupportSettings
           support_rests_on_model(! mesh_group_settings.support_material_buildplate_only),
           xy_distance(mesh_group_settings.support_xy_distance),
           xy_min_distance(std::min(mesh_group_settings.support_xy_distance, mesh_group_settings.support_xy_distance_overhang)),
+          xy_min_distance_per_region(mesh_group_settings.support_xy_distance_overhang_per_region),
+          // Plate-foot cap radius = support_tree_bp_diameter / 2. That field is not read from
+          // config here, so this is a fixed 3.75mm (7.5mm diameter), not a user setting.
           bp_radius(mesh_group_settings.support_tree_bp_diameter / 2),
           bp_radius_increase_per_layer(std::min(tan(0.7) * layer_height, 0.5 * support_line_width)),
           z_distance_bottom_layers(size_t(round(double(mesh_group_settings.support_bottom_distance) / double(layer_height)))),
@@ -299,14 +348,14 @@ struct TreeSupportSettings
             xy_min_distance = std::max(xy_min_distance, scaled<coord_t>(0.1));
             xy_distance     = std::max(xy_distance, xy_min_distance);
         }
-        
+
 
     //            const std::unordered_map<std::string, InterfacePreference> interface_map = { { "support_area_overwrite_interface_area", InterfacePreference::SupportAreaOverwritesInterface }, { "interface_area_overwrite_support_area", InterfacePreference::InterfaceAreaOverwritesSupport }, { "support_lines_overwrite_interface_area", InterfacePreference::SupportLinesOverwriteInterface }, { "interface_lines_overwrite_support_area", InterfacePreference::InterfaceLinesOverwriteSupport }, { "nothing", InterfacePreference::Nothing } };
     //            interface_preference = interface_map.at(mesh_group_settings.get<std::string>("support_interface_priority"));
     //FIXME this was the default
     //            interface_preference = InterfacePreference::SupportLinesOverwriteInterface;
         interface_preference = InterfacePreference::InterfaceAreaOverwritesSupport;
-        
+
         if (slicing_params.raft_layers() > 0) {
             // Fill in raft_layers with the heights of the layers below the first object layer.
             // First layer
@@ -424,6 +473,7 @@ public:
      * \brief minimum xy_distance. Only relevant when Z overrides XY, otherwise equal to xy_distance-
      */
     coord_t xy_min_distance;
+    std::vector<coord_t> xy_min_distance_per_region;
     /*!
      * \brief Amount of layers distance required the top of the support to the model
      */
@@ -497,14 +547,15 @@ public:
   public:
     bool operator==(const TreeSupportSettings& other) const
     {
-        return branch_radius == other.branch_radius && tip_layers == other.tip_layers && branch_radius_increase_per_layer == other.branch_radius_increase_per_layer && layer_start_bp_radius == other.layer_start_bp_radius && bp_radius == other.bp_radius && 
+        return branch_radius == other.branch_radius && tip_layers == other.tip_layers && branch_radius_increase_per_layer == other.branch_radius_increase_per_layer && layer_start_bp_radius == other.layer_start_bp_radius && bp_radius == other.bp_radius &&
                bp_radius_increase_per_layer == other.bp_radius_increase_per_layer && min_radius == other.min_radius && xy_min_distance == other.xy_min_distance &&
+               xy_min_distance_per_region == other.xy_min_distance_per_region &&
                xy_distance - xy_min_distance == other.xy_distance - other.xy_min_distance && // if the delta of xy_min_distance and xy_distance is different the collision areas have to be recalculated.
-               support_rests_on_model == other.support_rests_on_model && increase_radius_until_layer == other.increase_radius_until_layer && min_dtt_to_model == other.min_dtt_to_model && max_to_model_radius_increase == other.max_to_model_radius_increase && maximum_move_distance == other.maximum_move_distance && maximum_move_distance_slow == other.maximum_move_distance_slow && z_distance_bottom_layers == other.z_distance_bottom_layers && support_line_width == other.support_line_width && 
+               support_rests_on_model == other.support_rests_on_model && increase_radius_until_layer == other.increase_radius_until_layer && min_dtt_to_model == other.min_dtt_to_model && max_to_model_radius_increase == other.max_to_model_radius_increase && maximum_move_distance == other.maximum_move_distance && maximum_move_distance_slow == other.maximum_move_distance_slow && z_distance_bottom_layers == other.z_distance_bottom_layers && support_line_width == other.support_line_width &&
                support_line_spacing == other.support_line_spacing && support_roof_line_width == other.support_roof_line_width && // can not be set on a per-mesh basis currently, so code to enable processing different roof line width in the same iteration seems useless.
                support_bottom_offset == other.support_bottom_offset && support_wall_count == other.support_wall_count && support_pattern == other.support_pattern && roof_pattern == other.roof_pattern && // can not be set on a per-mesh basis currently, so code to enable processing different roof patterns in the same iteration seems useless.
-               support_roof_angles == other.support_roof_angles && 
-               //support_infill_angles == other.support_infill_angles && 
+               support_roof_angles == other.support_roof_angles &&
+               //support_infill_angles == other.support_infill_angles &&
                increase_radius_until_radius == other.increase_radius_until_radius && support_bottom_layers == other.support_bottom_layers && layer_height == other.layer_height && z_distance_top_layers == other.z_distance_top_layers && resolution == other.resolution && // Infill generation depends on deviation and resolution.
                support_roof_line_distance == other.support_roof_line_distance && interface_preference == other.interface_preference
                && min_feature_size == other.min_feature_size // interface_preference should be identical to ensure the tree will correctly interact with the roof.
@@ -512,17 +563,17 @@ public:
 #if 0
                 && (interface_preference == InterfacePreference::InterfaceAreaOverwritesSupport || interface_preference == InterfacePreference::SupportAreaOverwritesInterface
                 // Perimeter generator parameters
-                   || 
-                        (settings.get<bool>("fill_outline_gaps") == other.settings.get<bool>("fill_outline_gaps") && 
-                         settings.get<coord_t>("min_bead_width") == other.settings.get<coord_t>("min_bead_width") && 
-                         settings.get<double>("wall_transition_angle") == other.settings.get<double>("wall_transition_angle") && 
-                         settings.get<coord_t>("wall_transition_length") == other.settings.get<coord_t>("wall_transition_length") && 
-                         settings.get<Ratio>("wall_split_middle_threshold") == other.settings.get<Ratio>("wall_split_middle_threshold") && 
-                         settings.get<Ratio>("wall_add_middle_threshold") == other.settings.get<Ratio>("wall_add_middle_threshold") && 
-                         settings.get<int>("wall_distribution_count") == other.settings.get<int>("wall_distribution_count") && 
-                         settings.get<coord_t>("wall_transition_filter_distance") == other.settings.get<coord_t>("wall_transition_filter_distance") && 
-                         settings.get<coord_t>("wall_transition_filter_deviation") == other.settings.get<coord_t>("wall_transition_filter_deviation") && 
-                         settings.get<coord_t>("wall_line_width_x") == other.settings.get<coord_t>("wall_line_width_x") && 
+                   ||
+                        (settings.get<bool>("fill_outline_gaps") == other.settings.get<bool>("fill_outline_gaps") &&
+                         settings.get<coord_t>("min_bead_width") == other.settings.get<coord_t>("min_bead_width") &&
+                         settings.get<double>("wall_transition_angle") == other.settings.get<double>("wall_transition_angle") &&
+                         settings.get<coord_t>("wall_transition_length") == other.settings.get<coord_t>("wall_transition_length") &&
+                         settings.get<Ratio>("wall_split_middle_threshold") == other.settings.get<Ratio>("wall_split_middle_threshold") &&
+                         settings.get<Ratio>("wall_add_middle_threshold") == other.settings.get<Ratio>("wall_add_middle_threshold") &&
+                         settings.get<int>("wall_distribution_count") == other.settings.get<int>("wall_distribution_count") &&
+                         settings.get<coord_t>("wall_transition_filter_distance") == other.settings.get<coord_t>("wall_transition_filter_distance") &&
+                         settings.get<coord_t>("wall_transition_filter_deviation") == other.settings.get<coord_t>("wall_transition_filter_deviation") &&
+                         settings.get<coord_t>("wall_line_width_x") == other.settings.get<coord_t>("wall_line_width_x") &&
                          settings.get<int>("meshfix_maximum_extrusion_area_deviation") == other.settings.get<int>("meshfix_maximum_extrusion_area_deviation"))
                     )
 #endif
@@ -579,7 +630,7 @@ public:
 
 inline void tree_supports_show_error(std::string_view message, bool critical)
 { // todo Remove!  ONLY FOR PUBLIC BETA!!
-    printf("Error: %s, critical: %d\n", message.data(), int(critical));
+    //printf("Error: %s, critical: %d\n", message.data(), int(critical));
 #ifdef TREE_SUPPORT_SHOW_ERRORS_WIN32
     static bool g_showed_critical_error = false;
     static bool g_showed_performance_warning = false;
@@ -594,29 +645,72 @@ inline void tree_supports_show_error(std::string_view message, bool critical)
 
 inline double layer_z(const SlicingParameters &slicing_params, const TreeSupportSettings &config, const size_t layer_idx)
 {
-    return layer_idx >= config.raft_layers.size() ? 
+    return layer_idx >= config.raft_layers.size() ?
         slicing_params.object_print_z_min + slicing_params.first_object_layer_height + (layer_idx - config.raft_layers.size()) * slicing_params.layer_height :
         config.raft_layers[layer_idx];
 }
 // Lowest collision layer
 inline LayerIndex layer_idx_ceil(const SlicingParameters &slicing_params, const TreeSupportSettings &config, const double z)
 {
-    return 
+    return
         LayerIndex(config.raft_layers.size()) +
         std::max<LayerIndex>(0, ceil((z - slicing_params.object_print_z_min - slicing_params.first_object_layer_height) / slicing_params.layer_height));
 }
 // Highest collision layer
 inline LayerIndex layer_idx_floor(const SlicingParameters &slicing_params, const TreeSupportSettings &config, const double z)
 {
-    return 
-        LayerIndex(config.raft_layers.size()) + 
+    return
+        LayerIndex(config.raft_layers.size()) +
         std::max<LayerIndex>(0, floor((z - slicing_params.object_print_z_min - slicing_params.first_object_layer_height) / slicing_params.layer_height));
+}
+
+// Mid-plane Z used when slicing organic tubes: 0.5 * (bottom_z + print_z).
+inline double layer_mid_z(const SlicingParameters &slicing_params, const TreeSupportSettings &config, const LayerIndex layer_idx)
+{
+    const double print_z  = layer_z(slicing_params, config, size_t(layer_idx));
+    const double bottom_z = layer_idx > 0 ? layer_z(slicing_params, config, size_t(layer_idx - 1)) : 0.;
+    return 0.5 * (bottom_z + print_z);
+}
+
+// Lowest layer whose mid-plane is >= z. Prefer this over layer_idx_ceil when the caller
+// slices at mid-planes (organic_draw_branches); print-z ceil/floor can miss the last/first layer.
+inline LayerIndex layer_idx_mid_ceil(
+    const SlicingParameters   &slicing_params,
+    const TreeSupportSettings &config,
+    const double               z,
+    const LayerIndex           layer_count)
+{
+    if (layer_count <= 0)
+        return 0;
+    LayerIndex L = std::min(std::max(layer_idx_ceil(slicing_params, config, z), LayerIndex(0)), layer_count);
+    while (L > 0 && layer_mid_z(slicing_params, config, L - 1) >= z - EPSILON)
+        -- L;
+    while (L < layer_count && layer_mid_z(slicing_params, config, L) < z - EPSILON)
+        ++ L;
+    return L;
+}
+
+// Highest layer whose mid-plane is <= z, or -1 if none.
+inline LayerIndex layer_idx_mid_floor(
+    const SlicingParameters   &slicing_params,
+    const TreeSupportSettings &config,
+    const double               z,
+    const LayerIndex           layer_count)
+{
+    if (layer_count <= 0)
+        return -1;
+    LayerIndex L = std::min(std::max(layer_idx_floor(slicing_params, config, z), LayerIndex(0)), layer_count - 1);
+    while (L + 1 < layer_count && layer_mid_z(slicing_params, config, L + 1) <= z + EPSILON)
+        ++ L;
+    while (L >= 0 && layer_mid_z(slicing_params, config, L) > z + EPSILON)
+        -- L;
+    return L;
 }
 
 inline SupportGeneratorLayer& layer_initialize(
     SupportGeneratorLayer     &layer_new,
     const SlicingParameters   &slicing_params,
-    const TreeSupportSettings &config, 
+    const TreeSupportSettings &config,
     const size_t               layer_idx)
 {
     layer_new.print_z  = layer_z(slicing_params, config, layer_idx);
@@ -630,7 +724,7 @@ inline SupportGeneratorLayer& layer_allocate_unguarded(
     SupportGeneratorLayerStorage      &layer_storage,
     SupporLayerType                    layer_type,
     const SlicingParameters           &slicing_params,
-    const TreeSupportSettings         &config, 
+    const TreeSupportSettings         &config,
     size_t                             layer_idx)
 {
     SupportGeneratorLayer &layer = layer_storage.allocate_unguarded(layer_type);
@@ -641,7 +735,7 @@ inline SupportGeneratorLayer& layer_allocate(
     SupportGeneratorLayerStorage      &layer_storage,
     SupporLayerType                    layer_type,
     const SlicingParameters           &slicing_params,
-    const TreeSupportSettings         &config, 
+    const TreeSupportSettings         &config,
     size_t                             layer_idx)
 {
     SupportGeneratorLayer &layer = layer_storage.allocate(layer_type);
@@ -652,20 +746,20 @@ inline SupportGeneratorLayer& layer_allocate(
 class InterfacePlacer {
 public:
     InterfacePlacer(
-        const SlicingParameters         &slicing_parameters, 
+        const SlicingParameters         &slicing_parameters,
         const SupportParameters         &support_parameters,
-        const TreeSupportSettings       &config, 
-        SupportGeneratorLayerStorage    &layer_storage, 
+        const TreeSupportSettings       &config,
+        SupportGeneratorLayerStorage    &layer_storage,
         SupportGeneratorLayersPtr       &top_contacts,
         SupportGeneratorLayersPtr       &top_interfaces,
-        SupportGeneratorLayersPtr       &top_base_interfaces) 
+        SupportGeneratorLayersPtr       &top_base_interfaces)
     :
         slicing_parameters(slicing_parameters), support_parameters(support_parameters), config(config),
-        layer_storage(layer_storage), top_contacts(top_contacts), top_interfaces(top_interfaces), top_base_interfaces(top_base_interfaces)  
+        layer_storage(layer_storage), top_contacts(top_contacts), top_interfaces(top_interfaces), top_base_interfaces(top_base_interfaces)
     {}
     InterfacePlacer(const InterfacePlacer& rhs) :
         slicing_parameters(rhs.slicing_parameters), support_parameters(rhs.support_parameters), config(rhs.config),
-        layer_storage(rhs.layer_storage), top_contacts(rhs.top_contacts), top_interfaces(rhs.top_interfaces), top_base_interfaces(rhs.top_base_interfaces) 
+        layer_storage(rhs.layer_storage), top_contacts(rhs.top_contacts), top_interfaces(rhs.top_interfaces), top_base_interfaces(rhs.top_base_interfaces)
     {}
 
     const SlicingParameters    &slicing_parameters;
@@ -707,7 +801,7 @@ public:
             dtt_roof <= support_parameters.num_top_interface_layers_only() ? this->top_interfaces : this->top_base_interfaces;
         SupportGeneratorLayer*& l = layers[insert_layer_idx];
         if (l == nullptr)
-            l = &layer_allocate_unguarded(layer_storage, dtt_roof == 0 ? SupporLayerType::sltTopContact : SupporLayerType::sltTopInterface, 
+            l = &layer_allocate_unguarded(layer_storage, dtt_roof == 0 ? SupporLayerType::sltTopContact : SupporLayerType::sltTopInterface,
                     slicing_parameters, config, insert_layer_idx);
         // will be unioned in finalize_interface_and_support_areas()
         append(l->polygons, std::move(new_roofs));

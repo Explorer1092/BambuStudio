@@ -6,6 +6,7 @@
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/NotificationManager.hpp"
 #include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/Log.hpp"
 
 
 namespace Slic3r { namespace GUI {
@@ -106,7 +107,7 @@ void OrientJob::prepare_partplate() {
     if (plate->empty())
     {
         //no instances on this plate
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": no instances in current plate!");
+        BOOST_LOG_TRIVIAL(info) << boost::format("no instances in current plate!");
 
         return;
     }
@@ -155,6 +156,7 @@ void OrientJob::on_exception(const std::exception_ptr &eptr)
         if (eptr)
             std::rethrow_exception(eptr);
     } catch (std::exception &) {
+        BOOST_LOG_TRIVIAL(warning) << current_exception_message();
         PlaterJob::on_exception(eptr);
     }
 }
@@ -164,11 +166,11 @@ void OrientJob::process()
     auto start = std::chrono::steady_clock::now();
     static const auto arrangestr = _(L("Orienting..."));
 
-    const GLCanvas3D::OrientSettings& settings = m_plater->canvas3D()->get_orient_settings();
+    const bool min_area = m_plater->get_orient_min_area();
 
     orientation::OrientParams params;
     orientation::OrientParamsArea params_area;
-    if (settings.min_area) {
+    if (min_area) {
         memcpy(&params, &params_area, sizeof(params));
         params.min_volume = false;
     }
@@ -221,15 +223,39 @@ orientation::OrientMesh OrientJob::get_orient_mesh(ModelInstance* instance)
     auto obj = instance->get_object();
     om.name = obj->name;
     om.mesh = obj->mesh(); // don't know the difference to obj->raw_mesh(). Both seem OK
+    const Slic3r::DynamicPrintConfig& full_config = wxGetApp().preset_bundle->full_config();
     if (obj->config.has("support_threshold_angle"))
         om.overhang_angle = obj->config.opt_int("support_threshold_angle");
     else {
-        const Slic3r::DynamicPrintConfig& config = wxGetApp().preset_bundle->full_config();
-        om.overhang_angle = config.opt_int("support_threshold_angle");
+        om.overhang_angle = full_config.opt_int("support_threshold_angle");
     }
 
+    if (full_config.has("fan_direction") && full_config.has("auxiliary_fan"))
+    {
+        int fan_config_idx = full_config.option<ConfigOptionEnum<FanDirection>>("fan_direction")->value;
+        FanDirection config_dir = static_cast<FanDirection>(fan_config_idx);
+
+        if (config_dir == FanDirection::fdUndefine || !full_config.opt_bool("auxiliary_fan"))
+        {
+            om.cooling_direction = {0, 0, 0};   // no cooling fan, do not rotate along z axis
+        }
+        else if (config_dir == FanDirection::fdRight)
+        {
+            om.cooling_direction = {1, 0, 0};   // the cooling fan is on the right side.
+            om.has_cooling_fan = true;
+        }
+        else
+        {
+        // the cooling fan is on the left side
+        // or both side has cooling fans
+            om.cooling_direction = {-1, 0, 0};
+            om.has_cooling_fan = true;
+        }
+    }
+    
     om.setter = [instance](const OrientMesh& p) {
         instance->rotate(p.rotation_matrix);
+        instance->rotate(p.rotation_matrix_vertical);
         instance->get_object()->ensure_on_bed();
     };
     return om;

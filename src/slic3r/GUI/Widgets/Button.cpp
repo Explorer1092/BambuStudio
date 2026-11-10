@@ -4,9 +4,6 @@
 #include <wx/dcclient.h>
 #include <wx/dcgraph.h>
 #include <wx/tipwin.h>
-#ifdef __APPLE__
-#include "libslic3r/MacUtils.hpp"
-#endif
 BEGIN_EVENT_TABLE(Button, StaticBox)
 
 EVT_LEFT_DOWN(Button::mouseDown)
@@ -64,9 +61,11 @@ bool Button::Create(wxWindow* parent, wxString text, wxString icon, long style, 
 
 void Button::SetLabel(const wxString& label)
 {
-    wxWindow::SetLabel(label);
-    messureSize();
-    Refresh();
+    if (label != wxWindow::GetLabel()) {
+        wxWindow::SetLabel(label);
+        messureSize();
+        Refresh();
+    }
 }
 
 bool Button::SetFont(const wxFont& font)
@@ -79,9 +78,9 @@ bool Button::SetFont(const wxFont& font)
 
 void Button::SetIcon(const wxString& icon)
 {
-    auto tmpBitmap = ScalableBitmap(this, icon.ToStdString(), this->active_icon.px_cnt());
     if (!icon.IsEmpty()) {
         //BBS set button icon default size to 20
+        auto tmpBitmap = ScalableBitmap(this, icon.ToStdString(), this->active_icon.px_cnt());
         if (!tmpBitmap.bmp().IsSameAs(this->active_icon.bmp())) {
             this->active_icon = tmpBitmap;
             Refresh();
@@ -120,6 +119,14 @@ void Button::SetMaxSize(const wxSize& size)
 void Button::SetPaddingSize(const wxSize& size)
 {
     paddingSize = size;
+    messureSize();
+}
+
+void Button::SetAllowShrink(bool allow)
+{
+    if (m_allow_shrink == allow)
+        return;
+    m_allow_shrink = allow;
     messureSize();
 }
 
@@ -194,6 +201,9 @@ void Button::paintEvent(wxPaintEvent& evt)
 void Button::render(wxDC& dc)
 {
     StaticBox::render(dc);
+    if (m_left_corner_white || m_right_corner_white) {
+        renderWhiteCorners(dc);
+    }
     int states = state_handler.states();
     wxSize size = GetSize();
     dc.SetBrush(*wxTRANSPARENT_BRUSH);
@@ -218,7 +228,7 @@ void Button::render(wxDC& dc)
             textSize = dc.GetMultiLineTextExtent(text);
         }
     }
-    auto szContent = textSize;
+    auto szContent = text.IsEmpty() ? wxSize(0, 0) : textSize;
     if (icon.bmp().IsOk()) {
         if (szContent.y > 0) {
             //BBS norrow size between text and icon
@@ -274,27 +284,73 @@ void Button::render(wxDC& dc)
             pt.y += (rcContent.height - textSize.y) / 2;
         }
         dc.SetTextForeground(text_color.colorForStates(states));
-#if 0
-        dc.SetBrush(*wxLIGHT_GREY);
-        dc.SetPen(wxPen(*wxLIGHT_GREY));
-        dc.DrawRectangle(pt, textSize.GetSize());
-#endif
-#ifdef __WXOSX__
-        pt.y -= this->textSize.x / 2;
-#endif
-#ifdef __APPLE__
-        if (Slic3r::is_mac_version_15()) {
-        pt.y -= FromDIP(1);
-    }
-#endif
         dc.DrawText(text, pt);
     }
+}
+
+void Button::renderWhiteCorners(wxDC& dc)
+{
+    wxSize size = GetSize();
+    int r = static_cast<int>(radius);
+    wxColor parent_bg_color = StaticBox::GetParentBackgroundColor(GetParent());
+    int states = state_handler.states();
+    wxColor bg_color = background_color.colorForStates(states);
+
+    auto drawWhiteCorners = [&](wxDC &dc) {
+        dc.SetPen(*wxTRANSPARENT_PEN);
+        dc.SetBrush(wxBrush(parent_bg_color));
+
+        if (m_left_corner_white) {
+            dc.DrawRectangle(0, 0, r, r);
+            dc.DrawRectangle(0, size.y - r, r, r);
+
+            dc.SetBrush(wxBrush(bg_color));
+            dc.DrawRoundedRectangle(0, 0, r * 2, r * 2, r);
+            dc.DrawRoundedRectangle(0, size.y - r * 2, r * 2, r * 2, r);
+        }
+
+        if (m_right_corner_white) {
+            dc.DrawRectangle(size.x - r, 0, r, r);
+            dc.DrawRectangle(size.x - r, size.y - r, r, r);
+
+            dc.SetBrush(wxBrush(bg_color));
+            dc.DrawRoundedRectangle(size.x - r * 2, 0, r * 2, r * 2, r);
+            dc.DrawRoundedRectangle(size.x - r * 2, size.y - r * 2, r * 2, r * 2, r);
+        }
+    };
+#ifdef __WXMSW__
+    auto renderWithAntialiasing = [&]() -> bool {
+        wxMemoryDC memdc(&dc);
+        if (!memdc.IsOk()) return false;
+
+        wxBitmap bmp(size.x, size.y);
+        memdc.SelectObject(bmp);
+        memdc.Blit({0, 0}, size, &dc, {0, 0});
+
+        wxGCDC gcdc(memdc);
+        if (!gcdc.IsOk()) return false;
+
+        drawWhiteCorners(gcdc);
+
+        memdc.SelectObject(wxNullBitmap);
+        dc.DrawBitmap(bmp, 0, 0);
+        return true;
+    };
+
+    if (!renderWithAntialiasing()) {
+        drawWhiteCorners(dc);
+    }
+#else
+    drawWhiteCorners(dc);
+#endif
 }
 
 void Button::messureSize()
 {
     wxClientDC dc(this);
-    dc.GetTextExtent(GetLabel(), &textSize.width, &textSize.height, &textSize.x, &textSize.y);
+    dc.GetTextExtent(GetLabel(), &textSize.width, &textSize.height);
+    wxFontMetrics fm = dc.GetFontMetrics();
+    textSize.height = fm.ascent + fm.descent;
     wxSize szContent = textSize.GetSize();
     if (this->active_icon.bmp().IsOk()) {
         if (szContent.y > 0) {
@@ -326,10 +382,23 @@ void Button::messureSize()
         }
     }
 
-    if (minSize.GetWidth() > size.GetWidth())
-        wxWindow::SetMinSize(minSize);
-    else
-        wxWindow::SetMinSize(size);
+    // BBS: when shrinking is allowed, honor the explicit min width as the window's
+    // min size even though the content is wider. The sizer may then compress the
+    // button, and render() truncates the label with an ellipsis. The content width
+    // is still reported as the best size so the button prefers its full width.
+    if (m_allow_shrink && minSize.GetWidth() > 0) {
+        wxSize minWnd = size;
+        minWnd.SetWidth(minSize.GetWidth());
+        wxWindow::SetMinSize(minWnd);
+        // Keep the content size as the best-size hint so the sizer prefers the full
+        // width (up to the max) when there is room, and only compresses when crowded.
+        CacheBestSize(size);
+        return;
+    }
+
+    // A min width wider than the content must not drop the content height: minSize may
+    // leave its height unspecified (-1), and wx would then fall back to a 1px best height.
+    wxWindow::SetMinSize(wxSize(std::max(minSize.GetWidth(), size.GetWidth()), size.GetHeight()));
 }
 
 void Button::mouseDown(wxMouseEvent& event)
